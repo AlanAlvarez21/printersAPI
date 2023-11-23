@@ -39,20 +39,18 @@ app.post('/print', async (req, res) => {
 
   fs.writeFileSync('temp.zpl', zpl_code);
   const formData = new FormData();
-  
+
   // TODO: Make the serial number of the printer dynamic
   formData.append('sn', 'D8N230701799');
   formData.append('zpl_file', fs.createReadStream('temp.zpl'));
 
-
   const url = 'https://api.zebra.com/v2/devices/printers/send';
   const headers = {
     'accept': 'text/plain',
-    'apikey': process.env.APIKEY,
-    'tenant': process.env.TENANT,
+    'apikey': '31mA0UIAbKTGUMXm21ktVFAAf3emWyEQ',
+    'tenant': '490b6deb9f9691080a640daada7d91e9',
     'Content-Type': 'multipart/form-data', // Add Content-Type
   };
-
 
   try {
     const response = await axios.post(url, formData, {
@@ -62,18 +60,14 @@ app.post('/print', async (req, res) => {
       },
     });
 
-    if (response.status === 200) {
-      res.json({ 'message': 'ZPL file sent successfully' });
-    } else {
-      res.status(response.status).json({ 'message': 'Error sending the ZPL file', 'status_code': response.status });
-    }
+  res.json({ 'message': 'ZPL file sent successfully' });    
   } catch (error) {
     res.status(500).json({ 'message': 'Error sending the ZPL file', 'error': error.message });
   }
 });
 
-app.listen(process.env.PORT, () => {
-  console.log(`Servidor en ejecución en el puerto ${process.env.PORT}`);
+app.listen(3000, () => {
+  console.log(`Servidor en ejecución en el puerto 3000`);
 });
 
 module.exports = app;
