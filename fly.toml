@@ -1,0 +1,14 @@
+# fly.toml app configuration file generated for printerproxy on 2023-11-23T12:44:27-06:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "printerproxy"
+primary_region = "dfw"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
