@@ -5,7 +5,6 @@ const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use(cors());
 app.use(express.json());
 
@@ -40,6 +39,7 @@ app.post('/print', async (req, res) => {
 
   fs.writeFileSync('temp.zpl', zpl_code);
   const formData = new FormData();
+  
   // TODO: Make the serial number of the printer dynamic
   formData.append('sn', 'D8N230701799');
   formData.append('zpl_file', fs.createReadStream('temp.zpl'));
