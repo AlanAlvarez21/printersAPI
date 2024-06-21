@@ -10,31 +10,40 @@ app.use(express.json());
 
 app.post('/print', async (req, res) => {
 
-  console.log('Petición recibida en el servidor');
-  console.log('Body:', req.body);
+  console.log('**************************************************');
+  console.log('Etiqueta mandada:', req.body);
+  console.log('**************************************************');
   const longitudName = req.body.name.length;
 
   function setName() {
     return longitudName > 13 && longitudName < 25 ? 10 : 100;
   }
 
+
+
   const zpl_code = `
   ^XA
+
   ^CI28
   ^MMT
-  ^PW400
-  ^LL0500
-  ^LS0
-  ^FO${setName()},20^A0N,30,30^FD${req.body.name}^FS
-  ^FO10,60^A0N,35,35^FD     ${req.body.clave_producto}^FS
-  ^FO10,100^A0N,30,30^FDPB: ${req.body.peso_bruto}kg^FS
-  ^FO10,135^A0N,30,30^FDPN: ${req.body.peso_neto}kg ^FS
-  ^FO10,165^A0N,30,30^FDML: ${req.body.metros_lineales}m ^FS
-  ^FO10,200^BY2,2
-  ^BCN,80,Y,N,N
-  ^FD${req.body.lote}^FS
+  ^PW450
+  ^LL0700
+  ^LS50
+  ^FO200,200^GB450,297,2
+  ^FO0,10^A0N,30,30^^FS
+  ^FO300,300^GB450,85,2
+  ^FO0,10^A0N,30,30^^FS
+  ^FO260,60^A0N,35,30^FD ${req.body.name ? req.body.name : '-'}^FS
+  ^FO80,100^A0N,40,40^FD${req.body.clave_producto ? req.body.clave_producto : '-'}^FS
+  ^FO80,150^A0N,40,40^FDPB: ${req.body.peso_bruto ? req.body.peso_bruto : '-'}kg^FS
+  ^FO80,190^A0N,40,40^FDPN: ${req.body.peso_neto ? req.body.peso_neto : '-'}kg ^FS
+  ^FO80,230^A0N,40,40^FDML: ${req.body.metros_lineales ? req.body.metros_lineales : '-'}mts ^FS
+  ^FO100,280^BY2,2
+  ^BCN,60,Y,N,N
+  ^FO80,280^A0N,30,30^FD${req.body.lote ? req.body.lote : '-'}^FS
   ^PQ1,0,1,Y
   ^XZ
+  
   `;
 
   fs.writeFileSync('temp.zpl', zpl_code);
