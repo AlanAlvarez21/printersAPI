@@ -1,4 +1,3 @@
-from flask import Flask, jsonify, request
 import requests
 import time
 from datetime import datetime
@@ -6,26 +5,24 @@ from dbfread import DBF
 import os
 import json
 import hashlib
-import sys
-
-app = Flask(__name__)
 
 # API configuration
 API_BASE_URL = "https://wmsys.fly.dev/api/production_orders"  # Production URL
 
 # Batch configuration
 BATCH_SIZE = 50  # Number of records to send in each batch
+CHECK_INTERVAL = 60  # Check every 60 seconds
 
 # Rutas de los archivos .dbf
 DBF_PATHS = [
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ipedidoc.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ipedidod.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\oprod.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\opro.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ordproc.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\PEDIENTR.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\remc.dbf',
-    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\remd.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ipedidoc.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ipedidod.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\oprod.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\opro.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ordproc.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\PEDIENTR.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\remc.dbf',
+    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\remd.dbf',
 ]
 
 # File to store last processed state
@@ -99,12 +96,12 @@ def send_batch_to_api(batch_data):
         print(f"✗ Error sending batch to API: {str(e)}")
         return {"error": str(e)}
 
-def process_dbf_files_direct():
+def process_dbf_files():
     """Process DBF files and send only new/modified records to API in batches"""
     try:
-        print("=" * 50)
-        print("STARTING DBF PROCESSING")
-        print("=" * 50)
+        print("=" * 60)
+        print(f"AUTOMATIC DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
         
         state = load_state()
         print(f"Loaded state with {len(state)} entries")
@@ -119,7 +116,7 @@ def process_dbf_files_direct():
         print(f"Checking {len(DBF_PATHS)} DBF files:")
         for dbf_path in DBF_PATHS:
             try:
-                print(f"\\n--- Processing file: {dbf_path} ---")
+                print(f"\n--- Processing file: {dbf_path} ---")
                 if os.path.exists(dbf_path):
                     base_name = os.path.splitext(os.path.basename(dbf_path))[0]
                     print(f"File exists: {base_name}")
@@ -131,7 +128,7 @@ def process_dbf_files_direct():
                         
                     prev_file_info = state.get(dbf_path, {})
                     print(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
-                    print(f"Previous file info: mtime={prev_file_info.get('mtime', 0)}, size={prev_file_info.get('size', 0)}")
+                    print(f"Previous file info: mtime={prev_file_info.get('mtime', 'None')}, size={prev_file_info.get('size', 'None')}")
                     
                     if (file_info['mtime'] != prev_file_info.get('mtime', 0) or 
                         file_info['size'] != prev_file_info.get('size', 0)):
@@ -181,7 +178,7 @@ def process_dbf_files_direct():
                 import traceback
                 traceback.print_exc()
         
-        print(f"\\nTotal new/modified records found: {len(all_new_records)}")
+        print(f"\nTotal new/modified records found: {len(all_new_records)}")
         
         results = []
         if all_new_records:
@@ -206,7 +203,11 @@ def process_dbf_files_direct():
         elapsed_time = time.time() - start_time
         print(f'Check completed in: {elapsed_time:.2f} seconds')
         
-        response_data = {
+        print("=" * 60)
+        print("WAITING FOR NEXT CHECK...")
+        print("=" * 60)
+        
+        return {
             "status": "completed",
             "changes_found": changes_found,
             "records_processed": len(all_new_records),
@@ -214,57 +215,38 @@ def process_dbf_files_direct():
             "processing_time": elapsed_time
         }
         
-        print("=" * 50)
-        print("PROCESSING COMPLETED")
-        print("=" * 50)
-        
-        return response_data
-        
     except Exception as e:
         print(f"✗ Critical error in process_dbf_files: {str(e)}")
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-# Endpoint que acepta tanto GET como POST
-@app.route('/process', methods=['GET', 'POST'])
-def process_endpoint():
-    """Process DBF files via API endpoint"""
-    return jsonify(process_dbf_files_direct())
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
-
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with instructions"""
-    return jsonify({
-        "message": "DBF Uploader Service",
-        "endpoints": {
-            "GET /": "This help message",
-            "GET/POST /process": "Process DBF files and upload to API",
-            "GET /health": "Health check"
-        },
-        "status": "running"
-    })
+def automatic_processing_loop():
+    """Main loop that runs processing automatically"""
+    print("Starting automatic DBF processing service...")
+    print(f"Configuration:")
+    print(f"  - API URL: {API_BASE_URL}")
+    print(f"  - Check interval: {CHECK_INTERVAL} seconds")
+    print(f"  - Batch size: {BATCH_SIZE} records")
+    print(f"  - DBF files: {len(DBF_PATHS)}")
+    print("")
+    
+    while True:
+        try:
+            # Process files
+            result = process_dbf_files()
+            
+            # Wait for next check
+            print(f"Sleeping for {CHECK_INTERVAL} seconds...")
+            time.sleep(CHECK_INTERVAL)
+            
+        except KeyboardInterrupt:
+            print("\nStopping automatic processing service...")
+            break
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            print("Continuing...")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == '__main__':
-    # Si se llama con argumento "run", procesa directamente
-    if len(sys.argv) > 1 and sys.argv[1] == "run":
-        print("Running direct processing mode...")
-        result = process_dbf_files_direct()
-        print("Result:", json.dumps(result, indent=2))
-        sys.exit(0)
-    
-    # Modo normal: servidor Flask
-    print("Starting Flask server...")
-    print("Access endpoints:")
-    print("  http://localhost:5000/ - Home/Help")
-    print("  http://localhost:5000/process - Process DBF files")
-    print("  http://localhost:5000/health - Health check")
-    print("")
-    print("Or run directly with: python flask_dbf_uploader.py run")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    automatic_processing_loop()
