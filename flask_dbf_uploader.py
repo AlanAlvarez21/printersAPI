@@ -1,58 +1,32 @@
 from flask import Flask, jsonify, request
 import requests
 import time
-import threading
 from datetime import datetime
 from dbfread import DBF
 import os
 import json
 import hashlib
+import sys
 
 app = Flask(__name__)
 
 # API configuration
 API_BASE_URL = "https://wmsys.fly.dev/api/production_orders"  # Production URL
-# API_BASE_URL = "http://localhost:3000/api/production_orders"  # For local testing
 
 # Batch configuration
 BATCH_SIZE = 50  # Number of records to send in each batch
 
 # Rutas de los archivos .dbf
-# Para Windows (descomenta estas líneas si corres en Windows)
 DBF_PATHS = [
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ipedidoc.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ipedidod.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\oprod.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\opro.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\ordproc.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\PEDIENTR.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\remc.dbf',
-    'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\remd.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ipedidoc.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ipedidod.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\oprod.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\opro.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\ordproc.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\PEDIENTR.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\remc.dbf',
+    'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\remd.dbf',
 ]
-
-# Para macOS/Linux con montaje de red (comenta las líneas de arriba y descomenta estas si corres en Mac/Linux)
-# DBF_PATHS = [
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/ipedidoc.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/ipedidod.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/oprod.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/opro.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/ordproc.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/PEDIENTR.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/remc.dbf',
-#     '/Volumes/Server/alphaerp/Empresas/FLEXIEMP/remd.dbf',
-# ]
-
-# Para pruebas locales (descomenta estas líneas si tienes copias locales para pruebas)
-# DBF_PATHS = [
-#     './test_data/ipedidoc.dbf',
-#     './test_data/ipedidod.dbf',
-#     './test_data/oprod.dbf',
-#     './test_data/opro.dbf',
-#     './test_data/ordproc.dbf',
-#     './test_data/PEDIENTR.dbf',
-#     './test_data/remc.dbf',
-#     './test_data/remd.dbf',
-# ]
 
 # File to store last processed state
 STATE_FILE = "dbf_state.json"
@@ -90,7 +64,6 @@ def get_file_hash(filepath):
 def create_record_hash(record):
     """Create a hash of a record to detect changes"""
     try:
-        # Convert record to string and create hash
         record_str = json.dumps(record, sort_keys=True, default=str)
         return hashlib.md5(record_str.encode()).hexdigest()
     except Exception as e:
@@ -102,20 +75,16 @@ def send_batch_to_api(batch_data):
     try:
         print(f"Sending batch of {len(batch_data)} records to API...")
         
-        # Prepare the payload with batch data
         payload = {
             "company_name": "Flexiempaques",
-            "production_orders": batch_data  # Sending multiple orders
+            "production_orders": batch_data
         }
         
-        print(f"Payload: {json.dumps(payload, indent=2)[:500]}...")  # Show first 500 chars
-        
-        # Send POST request to batch endpoint
         response = requests.post(
             API_BASE_URL + "/batch",
             json=payload,
             headers={'Content-Type': 'application/json'},
-            timeout=30  # Add timeout
+            timeout=30
         )
         
         if response.status_code == 200:
@@ -124,26 +93,19 @@ def send_batch_to_api(batch_data):
             return result
         else:
             print(f"✗ Failed to send batch to API: {response.status_code} - {response.text}")
-            return {"error": f"API error: {response.status_code}", "status_code": response.status_code, "response_text": response.text}
+            return {"error": f"API error: {response.status_code}", "status_code": response.status_code}
             
     except Exception as e:
         print(f"✗ Error sending batch to API: {str(e)}")
         return {"error": str(e)}
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
-
-@app.route('/process', methods=['POST'])
-def process_dbf_files():
+def process_dbf_files_direct():
     """Process DBF files and send only new/modified records to API in batches"""
     try:
         print("=" * 50)
         print("STARTING DBF PROCESSING")
         print("=" * 50)
         
-        # Load previous state
         state = load_state()
         print(f"Loaded state with {len(state)} entries")
         
@@ -151,47 +113,37 @@ def process_dbf_files():
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f'Checking for changes at: {timestamp}')
         
-        # Track if any changes were processed
         changes_found = False
         all_new_records = []
         
         print(f"Checking {len(DBF_PATHS)} DBF files:")
-        # Process each DBF file
         for dbf_path in DBF_PATHS:
             try:
-                print(f"\n--- Processing file: {dbf_path} ---")
+                print(f"\\n--- Processing file: {dbf_path} ---")
                 if os.path.exists(dbf_path):
                     base_name = os.path.splitext(os.path.basename(dbf_path))[0]
                     print(f"File exists: {base_name}")
                     
-                    # Check if file has changed
                     file_info = get_file_hash(dbf_path)
                     if not file_info:
                         print(f"Could not get file info for {dbf_path}")
                         continue
                         
-                    print(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
-                    
-                    # Get previous file info
                     prev_file_info = state.get(dbf_path, {})
-                    print(f"Previous file info: mtime={prev_file_info.get('mtime', 'None')}, size={prev_file_info.get('size', 'None')}")
+                    print(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
+                    print(f"Previous file info: mtime={prev_file_info.get('mtime', 0)}, size={prev_file_info.get('size', 0)}")
                     
-                    # Check if file has been modified
                     if (file_info['mtime'] != prev_file_info.get('mtime', 0) or 
                         file_info['size'] != prev_file_info.get('size', 0)):
                         
                         print(f"✓ File {base_name} has been modified - processing...")
                         changes_found = True
                         
-                        # Open the DBF file
-                        print(f"Opening DBF file: {dbf_path}")
                         dbf = DBF(dbf_path, ignore_missing_memofile=True)
                         
-                        # Track processed records for this file
                         processed_records = state.get(f"{dbf_path}_records", {})
                         new_processed_records = {}
                         
-                        # Process records
                         record_count = 0
                         new_records = 0
                         updated_records = 0
@@ -199,35 +151,25 @@ def process_dbf_files():
                         print("Processing records...")
                         for record in dbf:
                             record_count += 1
-                            # Convert record to dictionary
                             record_dict = dict(record)
                             
-                            # Create record hash
                             record_hash = create_record_hash(record_dict)
                             if not record_hash:
                                 continue
                             
-                            # Check if this is a new or modified record
                             if record_hash not in processed_records:
-                                # New record
                                 print(f"  New record #{record_count}")
                                 all_new_records.append(record_dict)
                                 new_records += 1
                             elif processed_records[record_hash] != record_hash:
-                                # Modified record
                                 print(f"  Modified record #{record_count}")
                                 all_new_records.append(record_dict)
                                 updated_records += 1
                                 
-                            # Store record hash
                             new_processed_records[record_hash] = record_hash
                         
                         print(f"  Summary for {base_name}: {record_count} total, {new_records} new, {updated_records} updated")
-                        
-                        # Update state with processed records
                         state[f"{dbf_path}_records"] = new_processed_records
-                        
-                        # Update file info in state
                         state[dbf_path] = file_info
                     else:
                         print(f"- No changes in {base_name}")
@@ -239,15 +181,12 @@ def process_dbf_files():
                 import traceback
                 traceback.print_exc()
         
-        print(f"\nTotal new/modified records found: {len(all_new_records)}")
-        print(f"Changes found in files: {changes_found}")
+        print(f"\\nTotal new/modified records found: {len(all_new_records)}")
         
-        # Send records in batches
         results = []
         if all_new_records:
             print(f"Sending {len(all_new_records)} records in batches...")
             
-            # Send records in batches
             for i in range(0, len(all_new_records), BATCH_SIZE):
                 batch = all_new_records[i:i + BATCH_SIZE]
                 print(f"Sending batch {i//BATCH_SIZE + 1}/{(len(all_new_records)-1)//BATCH_SIZE + 1} ({len(batch)} records)")
@@ -257,19 +196,13 @@ def process_dbf_files():
                     "batch_size": len(batch),
                     "result": batch_result
                 })
-                time.sleep(0.1)  # Small delay between batches
+                time.sleep(0.1)
             
-            # Save state after processing
             save_state(state)
             print("State saved")
-        elif changes_found:
-            # Save state if files were processed but no new records found
-            save_state(state)
-            print("State saved (no new records to send)")
         else:
-            print("No changes found in any files")
+            print("No new or modified records to send")
         
-        # Calculate processing time
         elapsed_time = time.time() - start_time
         print(f'Check completed in: {elapsed_time:.2f} seconds')
         
@@ -278,31 +211,60 @@ def process_dbf_files():
             "changes_found": changes_found,
             "records_processed": len(all_new_records),
             "batches_sent": len(results),
-            "processing_time": elapsed_time,
-            "batch_results": results
+            "processing_time": elapsed_time
         }
         
         print("=" * 50)
         print("PROCESSING COMPLETED")
         print("=" * 50)
         
-        return jsonify(response_data)
+        return response_data
         
     except Exception as e:
         print(f"✗ Critical error in process_dbf_files: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return {"status": "error", "message": str(e)}
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    """Get current status and configuration"""
+# Endpoint que acepta tanto GET como POST
+@app.route('/process', methods=['GET', 'POST'])
+def process_endpoint():
+    """Process DBF files via API endpoint"""
+    return jsonify(process_dbf_files_direct())
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home endpoint with instructions"""
     return jsonify({
-        "api_base_url": API_BASE_URL,
-        "batch_size": BATCH_SIZE,
-        "dbf_paths": DBF_PATHS,
-        "state_file": STATE_FILE
+        "message": "DBF Uploader Service",
+        "endpoints": {
+            "GET /": "This help message",
+            "GET/POST /process": "Process DBF files and upload to API",
+            "GET /health": "Health check"
+        },
+        "status": "running"
     })
 
 if __name__ == '__main__':
+    # Si se llama con argumento "run", procesa directamente
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        print("Running direct processing mode...")
+        result = process_dbf_files_direct()
+        print("Result:", json.dumps(result, indent=2))
+        sys.exit(0)
+    
+    # Modo normal: servidor Flask
+    print("Starting Flask server...")
+    print("Access endpoints:")
+    print("  http://localhost:5000/ - Home/Help")
+    print("  http://localhost:5000/process - Process DBF files")
+    print("  http://localhost:5000/health - Health check")
+    print("")
+    print("Or run directly with: python flask_dbf_uploader.py run")
+    
     app.run(host='0.0.0.0', port=5000, debug=True)
