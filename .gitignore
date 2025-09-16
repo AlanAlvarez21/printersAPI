@@ -39,7 +39,14 @@ bower_components
 build/Release
 
 # Dependency directories
-node_modules/
+node_modules
+venv/
+__pycache__/
+*.pyc
+.env
+dist/
+build/
+*.spec/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
