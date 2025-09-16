@@ -8,12 +8,12 @@ on:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022  # Especificar versión para evitar migración
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4  # Versión actualizada
     
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5  # Versión actualizada
       with:
         python-version: 3.9
         
@@ -31,7 +31,7 @@ jobs:
         pyinstaller --onefile --console --name DBF_Uploader_Flexi flask_dbf_uploader.py
         
     - name: Upload artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4  # Versión actualizada
       with:
         name: windows-executable
         path: dist/DBF_Uploader_Flexi.exe
