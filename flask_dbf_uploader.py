@@ -15,30 +15,31 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('corrected_dbf_uploader.log', encoding='utf-8'),
+        logging.FileHandler('final_production_uploader.log', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger('CorrectedDBFUploader')
+logger = logging.getLogger('FinalProductionUploader')
 
 # API configuration - WORKING URLs
 API_BASE_URL = "https://wmsys.fly.dev"
 API_ENDPOINT = "/api/production_orders/batch"
-API_TIMEOUT = 30
+API_TIMEOUT = 90  # Increased timeout for large batches
 MAX_RETRIES = 3
 
-# Configuration
+# Configuration - NO LIMITS FOR PRODUCTION
 CHECK_INTERVAL = 60
-BATCH_SIZE = 50
-MAX_RECORDS_TO_PROCESS = 100  # Limit for testing
+BATCH_SIZE = 30  # Smaller batches to prevent timeouts
+MAX_RECORDS_TO_PROCESS = 1000  # More than enough for 930 records
+DELAY_BETWEEN_BATCHES = 3  # Seconds between batches
 
 # Ruta del archivo opro.dbf
-OPRO_DBF_PATH = 'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\opro.dbf'
+OPRO_DBF_PATH = 'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\opro.dbf'
 
 # File to store last processed state
-STATE_FILE = "corrected_dbf_state.json"
+STATE_FILE = "production_dbf_state.json"
 
-class CorrectedDBFUploader:
+class FinalProductionUploader:
     def __init__(self):
         self.state = self.load_state()
         self.session = requests.Session()
@@ -78,15 +79,6 @@ class CorrectedDBFUploader:
             logger.error(f"Error getting file hash for {filepath}: {e}")
             return None
 
-    def create_record_hash(self, record: Dict) -> Optional[str]:
-        """Create a hash of a record to detect changes"""
-        try:
-            record_str = json.dumps(record, sort_keys=True, default=str, ensure_ascii=False)
-            return hashlib.md5(record_str.encode('utf-8')).hexdigest()
-        except Exception as e:
-            logger.error(f"Error creating record hash: {e}")
-            return None
-
     def clean_value(self, value: Any) -> str:
         """Clean and convert value to appropriate type"""
         if value is None or str(value).lower() in ['nan', 'none', '']:
@@ -116,12 +108,14 @@ class CorrectedDBFUploader:
             
             # Use the EXACT format that worked in your curl test
             mapped_record = {
-                "product_id": "be08b4e8-50bb-4def-b3eb-10b23ed46faf",  # Updated product_id from your working test
+                "product_id": "be08b4e8-50bb-4def-b3eb-10b23ed46faf",  # Working product_id
                 "quantity_requested": max(1, int(float(cleaned_record.get('CANT_LIQ', '0') or '0'))),
                 "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Your production warehouse
                 "priority": self.determine_priority(cleaned_record),
                 "notes": cleaned_record.get('OBSERVAT', ''),
                 "no_opro": cleaned_record.get('NO_OPRO', ''),
+                "lote_referencia": cleaned_record.get('LOTE', ''),
+                "stat_opro": cleaned_record.get('OPROSTAT', ''),
             }
             
             return mapped_record
@@ -131,12 +125,12 @@ class CorrectedDBFUploader:
             return None
 
     def send_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of records to the API endpoint with retry logic - EXACT format"""
+        """Send a batch of records to the API endpoint with retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(f"Sending batch of {len(batch_data)} records to API (attempt {attempt + 1})")
                 
-                # Use the EXACT payload format that worked in your curl test
+                # Use the EXACT payload format that worked
                 payload = {
                     "company_name": "Flexiempaques",
                     "production_orders": batch_data
@@ -148,10 +142,8 @@ class CorrectedDBFUploader:
                     logger.info(f"First record - NO_OPRO: {first_record.get('no_opro', 'N/A')}, "
                                f"Quantity: {first_record.get('quantity_requested', 'N/A')}")
                 
-                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:1000]}...")
-                
                 response = self.session.post(
-                    API_BASE_URL + API_ENDPOINT,  # Use the working endpoint
+                    API_BASE_URL + API_ENDPOINT,
                     json=payload,
                     headers={'Content-Type': 'application/json'},
                     timeout=API_TIMEOUT
@@ -162,9 +154,9 @@ class CorrectedDBFUploader:
                 if response.status_code == 200:
                     try:
                         result = response.json()
-                        logger.debug(f"API Response: {json.dumps(result, indent=2, ensure_ascii=False)[:1000]}...")
+                        logger.debug(f"API Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
                         
-                        # Extract success information from the working format
+                        # Handle different response formats
                         if 'success_count' in result and 'total_count' in result:
                             success_count = result['success_count']
                             total_count = result['total_count']
@@ -173,6 +165,15 @@ class CorrectedDBFUploader:
                             success_count = sum(1 for r in result['results'] if r.get('status') == 'success')
                             total_count = len(result['results'])
                             logger.info(f"API processed batch: {success_count}/{total_count} records successful")
+                            # Log any specific errors
+                            error_count = 0
+                            for i, r in enumerate(result['results']):
+                                if r.get('status') != 'success':
+                                    error_count += 1
+                                    if error_count <= 5:  # Only log first 5 errors
+                                        logger.error(f"Record {i} failed: {r.get('message', 'Unknown error')}")
+                            if error_count > 5:
+                                logger.error(f"... and {error_count - 5} more errors")
                         else:
                             # Assume all successful if we got 200 OK
                             success_count = len(batch_data)
@@ -190,37 +191,47 @@ class CorrectedDBFUploader:
                     logger.warning(f"API returned {response.status_code}: {response.text}")
                     if response.status_code == 422:
                         logger.error("VALIDATION ERROR - Check payload format")
-                        logger.error(f"Full payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                        if batch_data:
+                            logger.error(f"First record sample: {json.dumps(batch_data[0], indent=2, ensure_ascii=False)}")
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 ** attempt)
+                        wait_time = 2 ** attempt
+                        logger.info(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
                         continue
                         
             except requests.exceptions.Timeout:
-                logger.warning(f"Timeout on attempt {attempt + 1}")
+                logger.warning(f"Timeout on attempt {attempt + 1} (timeout={API_TIMEOUT}s)")
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = 2 ** attempt
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
                     continue
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error on attempt {attempt + 1}: {e}")
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = 2 ** attempt
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
                     continue
             except Exception as e:
                 logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
                 logger.error(traceback.format_exc())
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = 2 ** attempt
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
                     continue
                     
         logger.error("Failed to send batch after all retries")
         return {"success": False, "error": "Failed after retries"}
 
     def process_opro_file(self) -> Dict:
-        """Process opro.dbf file and send records to API"""
+        """Process opro.dbf file and send ALL records to API - NO LIMITS"""
         try:
             logger.info("=" * 60)
-            logger.info(f"CORRECTED DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"FINAL PRODUCTION DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
+            logger.info("PROCESSING ALL RECORDS - NO ARTIFICIAL LIMITS")
             
             start_time = time.time()
             
@@ -248,23 +259,19 @@ class CorrectedDBFUploader:
                 logger.info("=" * 60)
                 return {"status": "completed", "changes_found": False, "records_processed": 0}
                 
-            logger.info("File has been modified - processing...")
+            logger.info("File has been modified - processing ALL records...")
             
             # Open the DBF file
             logger.info(f"Opening DBF file: {OPRO_DBF_PATH}")
             dbf = DBF(OPRO_DBF_PATH, ignore_missing_memofile=True)
             
-            # Process records with limit for testing
+            # Process ALL records - NO ARTIFICIAL LIMIT
             all_records = []
             record_count = 0
             
-            logger.info(f"Processing up to {MAX_RECORDS_TO_PROCESS} records...")
+            logger.info("Processing ALL records from DBF file...")
             for record in dbf:
                 record_count += 1
-                if record_count > MAX_RECORDS_TO_PROCESS:
-                    logger.info(f"Reached limit of {MAX_RECORDS_TO_PROCESS} records, stopping...")
-                    break
-                    
                 record_dict = dict(record)
                 
                 # Map record to API format
@@ -272,24 +279,22 @@ class CorrectedDBFUploader:
                 if mapped_record:
                     all_records.append(mapped_record)
                 
-                # Show progress
-                if record_count % 50 == 0:
+                # Show progress every 100 records
+                if record_count % 100 == 0:
                     logger.info(f"Processed {record_count} records...")
             
-            logger.info(f"Prepared {len(all_records)} records for sending")
+            logger.info(f"TOTAL records prepared: {len(all_records)} (out of {record_count} in file)")
             
-            # Send records in batches
+            # Send ALL records in batches
             if all_records:
-                total_batches = min(((len(all_records)-1) // BATCH_SIZE) + 1, 2)  # Limit to 2 batches for testing
-                logger.info(f"Sending {len(all_records)} records in {total_batches} batches...")
+                total_batches = ((len(all_records)-1) // BATCH_SIZE) + 1
+                logger.info(f"Sending {len(all_records)} records in {total_batches} batches of {BATCH_SIZE} each")
                 
                 successful_sends = 0
                 total_sent = 0
+                failed_batches = 0
                 
                 for i in range(0, len(all_records), BATCH_SIZE):
-                    if i >= BATCH_SIZE * 2:  # Limit to 2 batches for testing
-                        break
-                        
                     batch = all_records[i:i + BATCH_SIZE]
                     batch_index = i // BATCH_SIZE + 1
                     logger.info(f"Sending batch {batch_index}/{total_batches} ({len(batch)} records)")
@@ -301,12 +306,17 @@ class CorrectedDBFUploader:
                         total_sent += batch_result.get("total_count", len(batch))
                         logger.info(f"Batch {batch_index} completed: {batch_result.get('success_count', 0)}/{batch_result.get('total_count', len(batch))} successful")
                     else:
+                        failed_batches += 1
                         logger.error(f"Batch {batch_index} failed: {batch_result.get('error', 'Unknown error')}")
                     
-                    # Delay between batches
-                    time.sleep(1)
+                    # Delay between batches to prevent API overload
+                    if batch_index < total_batches:
+                        logger.info(f"Waiting {DELAY_BETWEEN_BATCHES} seconds before next batch...")
+                        time.sleep(DELAY_BETWEEN_BATCHES)
                 
-                logger.info(f"Overall result: {successful_sends}/{total_sent} records sent successfully")
+                logger.info(f"FINAL RESULT: {successful_sends}/{total_sent} records sent successfully")
+                if failed_batches > 0:
+                    logger.warning(f"Failed batches: {failed_batches}/{total_batches}")
                 
                 # Update state
                 self.state['file_info'] = file_info
@@ -333,8 +343,10 @@ class CorrectedDBFUploader:
             return {
                 "status": "completed",
                 "records_processed": len(all_records),
+                "total_records_in_file": record_count,
                 "successful_sends": successful_sends,
                 "total_sent": total_sent,
+                "failed_batches": failed_batches,
                 "processing_time": elapsed_time
             }
             
@@ -349,8 +361,11 @@ class CorrectedDBFUploader:
             result = self.process_opro_file()
             if result.get("status") == "completed":
                 logger.info(f"Summary: {result.get('records_processed', 0)} records processed")
+                logger.info(f"Total in file: {result.get('total_records_in_file', 0)} records")
                 if 'successful_sends' in result:
                     logger.info(f"Successfully sent: {result.get('successful_sends', 0)}/{result.get('total_sent', 0)} records")
+                    if result.get('failed_batches', 0) > 0:
+                        logger.warning(f"Failed batches: {result.get('failed_batches', 0)}")
                 return True
             else:
                 logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
@@ -362,12 +377,14 @@ class CorrectedDBFUploader:
 
     def run_continuous(self) -> None:
         """Main loop that runs processing continuously"""
-        logger.info("Starting CORRECTED DBF processing service...")
+        logger.info("Starting FINAL PRODUCTION DBF processing service...")
         logger.info("Configuration:")
         logger.info(f"  - API URL: {API_BASE_URL}{API_ENDPOINT}")
         logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
         logger.info(f"  - Batch size: {BATCH_SIZE} records")
-        logger.info(f"  - Max records to process: {MAX_RECORDS_TO_PROCESS}")
+        logger.info(f"  - NO ARTIFICIAL LIMITS - Processing ALL records")
+        logger.info(f"  - API timeout: {API_TIMEOUT} seconds")
+        logger.info(f"  - Delay between batches: {DELAY_BETWEEN_BATCHES} seconds")
         logger.info(f"  - DBF file: {OPRO_DBF_PATH}")
         logger.info("")
         
@@ -389,11 +406,11 @@ class CorrectedDBFUploader:
 def main():
     """Main function"""
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        uploader = CorrectedDBFUploader()
+        uploader = FinalProductionUploader()
         success = uploader.run_once()
         sys.exit(0 if success else 1)
     else:
-        uploader = CorrectedDBFUploader()
+        uploader = FinalProductionUploader()
         uploader.run_continuous()
 
 if __name__ == '__main__':
