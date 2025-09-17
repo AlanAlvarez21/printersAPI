@@ -117,7 +117,7 @@ class DBFUploader:
                 # Required fields from API schema
                 "product_id": "9ef77e17-4a1f-435f-99e3-21dbff7c68ee",  # Default product ID
                 "quantity_requested": max(1, int(float(cleaned_record.get('CANT_LIQ', '0') or '0'))),
-                "warehouse_id": "45c4bbc8-2950-434c-b710-2ae0e080bfd1",  # Default warehouse ID
+                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Your production warehouse ID
                 
                 # Optional but useful fields from schema
                 "no_opro": cleaned_record.get('NO_OPRO', ''),
