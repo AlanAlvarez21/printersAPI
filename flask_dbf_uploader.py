@@ -15,15 +15,15 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('dbf_final_uploader.log', encoding='utf-8'),
+        logging.FileHandler('corrected_dbf_uploader.log', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger('DBFUploader')
+logger = logging.getLogger('CorrectedDBFUploader')
 
-# API configuration - UPDATED URL
+# API configuration - WORKING URLs
 API_BASE_URL = "https://wmsys.fly.dev"
-API_ENDPOINT = "/api/production_orders"
+API_ENDPOINT = "/api/production_orders/batch"
 API_TIMEOUT = 30
 MAX_RETRIES = 3
 
@@ -33,12 +33,12 @@ BATCH_SIZE = 50
 MAX_RECORDS_TO_PROCESS = 100  # Limit for testing
 
 # Ruta del archivo opro.dbf
-OPRO_DBF_PATH = 'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\opro.dbf'
+OPRO_DBF_PATH = 'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\opro.dbf'
 
 # File to store last processed state
-STATE_FILE = "final_dbf_state.json"
+STATE_FILE = "corrected_dbf_state.json"
 
-class DBFUploader:
+class CorrectedDBFUploader:
     def __init__(self):
         self.state = self.load_state()
         self.session = requests.Session()
@@ -109,21 +109,19 @@ class DBFUploader:
             return 'medium'
 
     def map_opro_record_to_api(self, record: Dict) -> Optional[Dict]:
-        """Map opro.dbf record to exact API schema format"""
+        """Map opro.dbf record to EXACT API format that works"""
         try:
             # Convert all values to strings and clean them
             cleaned_record = {k: self.clean_value(v) for k, v in record.items()}
             
-            # Extract the fields that match the API schema
+            # Use the EXACT format that worked in your curl test
             mapped_record = {
-                "product_id": "9ef77e17-4a1f-435f-99e3-21dbff7c68ee",
+                "product_id": "be08b4e8-50bb-4def-b3eb-10b23ed46faf",  # Updated product_id from your working test
                 "quantity_requested": max(1, int(float(cleaned_record.get('CANT_LIQ', '0') or '0'))),
-                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",
-                "no_opro": cleaned_record.get('NO_OPRO', ''),
+                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Your production warehouse
                 "priority": self.determine_priority(cleaned_record),
                 "notes": cleaned_record.get('OBSERVAT', ''),
-                "lote_referencia": cleaned_record.get('LOTE', ''),
-                "stat_opro": cleaned_record.get('OPROSTAT', ''),
+                "no_opro": cleaned_record.get('NO_OPRO', ''),
             }
             
             return mapped_record
@@ -133,11 +131,12 @@ class DBFUploader:
             return None
 
     def send_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of records to the API endpoint with retry logic"""
+        """Send a batch of records to the API endpoint with retry logic - EXACT format"""
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(f"Sending batch of {len(batch_data)} records to API (attempt {attempt + 1})")
                 
+                # Use the EXACT payload format that worked in your curl test
                 payload = {
                     "company_name": "Flexiempaques",
                     "production_orders": batch_data
@@ -149,8 +148,10 @@ class DBFUploader:
                     logger.info(f"First record - NO_OPRO: {first_record.get('no_opro', 'N/A')}, "
                                f"Quantity: {first_record.get('quantity_requested', 'N/A')}")
                 
+                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:1000]}...")
+                
                 response = self.session.post(
-                    API_BASE_URL + API_ENDPOINT + "/batch",
+                    API_BASE_URL + API_ENDPOINT,  # Use the working endpoint
                     json=payload,
                     headers={'Content-Type': 'application/json'},
                     timeout=API_TIMEOUT
@@ -161,21 +162,21 @@ class DBFUploader:
                 if response.status_code == 200:
                     try:
                         result = response.json()
-                        logger.debug(f"API Response: {json.dumps(result, indent=2)[:500]}...")
+                        logger.debug(f"API Response: {json.dumps(result, indent=2, ensure_ascii=False)[:1000]}...")
                         
-                        # Try to get success count from different possible formats
-                        success_count = 0
-                        total_count = len(batch_data)
-                        
-                        if 'results' in result:
-                            success_count = sum(1 for r in result['results'] if r.get('status') == 'success')
+                        # Extract success information from the working format
+                        if 'success_count' in result and 'total_count' in result:
+                            success_count = result['success_count']
+                            total_count = result['total_count']
                             logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                        elif 'success_count' in result:
-                            success_count = result.get('success_count', 0)
+                        elif 'results' in result:
+                            success_count = sum(1 for r in result['results'] if r.get('status') == 'success')
+                            total_count = len(result['results'])
                             logger.info(f"API processed batch: {success_count}/{total_count} records successful")
                         else:
-                            # If we got 200 OK, assume all were processed
-                            success_count = total_count
+                            # Assume all successful if we got 200 OK
+                            success_count = len(batch_data)
+                            total_count = len(batch_data)
                             logger.info(f"API processed batch: {success_count}/{total_count} records successful (assumed)")
                         
                         return {"success": True, "data": result, "success_count": success_count, "total_count": total_count}
@@ -188,8 +189,8 @@ class DBFUploader:
                 else:
                     logger.warning(f"API returned {response.status_code}: {response.text}")
                     if response.status_code == 422:
-                        logger.error("Validation error - check payload format")
-                        logger.error(f"Payload sample: {json.dumps(payload, indent=2)[:500]}...")
+                        logger.error("VALIDATION ERROR - Check payload format")
+                        logger.error(f"Full payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(2 ** attempt)
                         continue
@@ -218,7 +219,7 @@ class DBFUploader:
         """Process opro.dbf file and send records to API"""
         try:
             logger.info("=" * 60)
-            logger.info(f"FINAL DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"CORRECTED DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
             start_time = time.time()
@@ -332,6 +333,8 @@ class DBFUploader:
             return {
                 "status": "completed",
                 "records_processed": len(all_records),
+                "successful_sends": successful_sends,
+                "total_sent": total_sent,
                 "processing_time": elapsed_time
             }
             
@@ -346,6 +349,8 @@ class DBFUploader:
             result = self.process_opro_file()
             if result.get("status") == "completed":
                 logger.info(f"Summary: {result.get('records_processed', 0)} records processed")
+                if 'successful_sends' in result:
+                    logger.info(f"Successfully sent: {result.get('successful_sends', 0)}/{result.get('total_sent', 0)} records")
                 return True
             else:
                 logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
@@ -357,7 +362,7 @@ class DBFUploader:
 
     def run_continuous(self) -> None:
         """Main loop that runs processing continuously"""
-        logger.info("Starting FINAL DBF processing service...")
+        logger.info("Starting CORRECTED DBF processing service...")
         logger.info("Configuration:")
         logger.info(f"  - API URL: {API_BASE_URL}{API_ENDPOINT}")
         logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
@@ -384,11 +389,11 @@ class DBFUploader:
 def main():
     """Main function"""
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        uploader = DBFUploader()
+        uploader = CorrectedDBFUploader()
         success = uploader.run_once()
         sys.exit(0 if success else 1)
     else:
-        uploader = DBFUploader()
+        uploader = CorrectedDBFUploader()
         uploader.run_continuous()
 
 if __name__ == '__main__':
