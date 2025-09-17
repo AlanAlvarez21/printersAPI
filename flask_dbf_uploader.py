@@ -15,26 +15,27 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('dbf_single_uploader.log', encoding='utf-8'),
+        logging.FileHandler('dbf_uploader.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger('DBFUploader')
 
 # API configuration
-API_BASE_URL = "https://wmsys.fly.dev/api/production_orders"  # Production URL
+API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
+API_ENDPOINT = "/api/production_orders"  # API endpoint
 API_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 
 # Configuration
 CHECK_INTERVAL = 60  # Check every 60 seconds
-MAX_RECORDS_TO_SEND = 10  # Only send first 10 records for testing
+BATCH_SIZE = 50  # Number of records to send in each batch
 
 # Ruta del archivo opro.dbf (ajusta según tu sistema)
 OPRO_DBF_PATH = 'C:\\ALPHAERP\\Empresas\\FLEXIEMP\\opro.dbf'
 
 # File to store last processed state
-STATE_FILE = "dbf_single_state.json"
+STATE_FILE = "dbf_state.json"
 
 class DBFUploader:
     def __init__(self):
@@ -45,7 +46,7 @@ class DBFUploader:
         """Load the last processed state from file"""
         try:
             if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                with open(STATE_FILE, 'r') as f:
                     state = json.load(f)
                     logger.info(f"Loaded state with {len(state)} entries")
                     return state
@@ -56,8 +57,8 @@ class DBFUploader:
     def save_state(self) -> bool:
         """Save the current state to file"""
         try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
+            with open(STATE_FILE, 'w') as f:
+                json.dump(self.state, f, indent=2)
             logger.debug("State saved successfully")
             return True
         except Exception as e:
@@ -79,8 +80,8 @@ class DBFUploader:
     def create_record_hash(self, record: Dict) -> Optional[str]:
         """Create a hash of a record to detect changes"""
         try:
-            record_str = json.dumps(record, sort_keys=True, default=str, ensure_ascii=False)
-            return hashlib.md5(record_str.encode('utf-8')).hexdigest()
+            record_str = json.dumps(record, sort_keys=True, default=str)
+            return hashlib.md5(record_str.encode()).hexdigest()
         except Exception as e:
             logger.error(f"Error creating record hash: {e}")
             return None
@@ -89,7 +90,7 @@ class DBFUploader:
         """Clean and convert value to appropriate type"""
         if value is None or str(value).lower() in ['nan', 'none', '']:
             return ''
-        return str(value).strip()
+        return str(value)
 
     def determine_priority(self, record: Dict) -> str:
         """Determine priority based on status"""
@@ -107,28 +108,24 @@ class DBFUploader:
             return 'medium'
 
     def map_opro_record_to_api(self, record: Dict) -> Optional[Dict]:
-        """Map opro.dbf record to exact API schema format"""
+        """Map opro.dbf record to exact API schema format - ONLY required fields"""
         try:
             # Convert all values to strings and clean them
             cleaned_record = {k: self.clean_value(v) for k, v in record.items()}
             
-            # Log sample data for debugging
-            no_opro = cleaned_record.get('NO_OPRO', 'N/A')
-            cantidad = cleaned_record.get('CANT_LIQ', '0')
-            estado = cleaned_record.get('OPROSTAT', 'N/A')
-            logger.debug(f"Mapping record - NO_OPRO: {no_opro}, CANTIDAD: {cantidad}, ESTADO: {estado}")
-            
-            # Extract the fields that match the API schema
+            # Extract only the fields that match the API schema
             mapped_record = {
                 # Required fields from API schema
-                "product_id": "9ef77e17-4a1f-435f-99e3-21dbff7c68ee",
+                "product_id": "9ef77e17-4a1f-435f-99e3-21dbff7c68ee",  # Default product ID
                 "quantity_requested": max(1, int(float(cleaned_record.get('CANT_LIQ', '0') or '0'))),
-                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",
+                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Your production warehouse ID
                 
-                # Optional fields from schema
+                # Optional but useful fields from schema
                 "no_opro": cleaned_record.get('NO_OPRO', ''),
                 "priority": self.determine_priority(cleaned_record),
-                "notes": cleaned_record.get('OBSERVAT', ''),
+                "notes": cleaned_record.get('OBSERVAT', ''),  # This maps to your notes field
+                
+                # Additional fields that are part of the schema
                 "lote_referencia": cleaned_record.get('LOTE', ''),
                 "stat_opro": cleaned_record.get('OPROSTAT', ''),
             }
@@ -139,46 +136,33 @@ class DBFUploader:
             logger.error(f"Error mapping record to API schema: {e}")
             return None
 
-    def send_single_record_to_api(self, record_data: Dict) -> Dict:
-        """Send a single record to the API endpoint with retry logic"""
+    def send_batch_to_api(self, batch_data: List[Dict]) -> Dict:
+        """Send a batch of records to the API endpoint with retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
-                logger.info(f"Sending single record to API (attempt {attempt + 1})")
-                logger.info(f"Record data: NO_OPRO={record_data.get('no_opro', 'N/A')}, "
-                           f"Quantity={record_data.get('quantity_requested', 'N/A')}")
+                logger.info(f"Sending batch of {len(batch_data)} records to API (attempt {attempt + 1})")
                 
                 payload = {
                     "company_name": "Flexiempaques",
-                    "production_order": record_data  # Single record, not array
+                    "production_orders": batch_data
                 }
                 
-                logger.debug(f"Single payload: {json.dumps(payload, indent=2)[:500]}...")
-                
                 response = self.session.post(
-                    API_BASE_URL,  # Single endpoint, not batch
+                    API_BASE_URL + API_ENDPOINT + "/batch",
                     json=payload,
                     headers={'Content-Type': 'application/json'},
                     timeout=API_TIMEOUT
                 )
                 
-                logger.info(f"API Response Status: {response.status_code}")
-                
                 if response.status_code == 200:
-                    try:
-                        result = response.json()
-                        logger.debug(f"API Response Body: {json.dumps(result, indent=2)[:500]}...")
-                        logger.info("Single record sent successfully")
-                        return {"success": True, "data": result}
-                    except Exception as json_error:
-                        logger.error(f"Error parsing JSON response: {json_error}")
-                        logger.error(f"Response text: {response.text[:500]}...")
-                        return {"success": True, "data": {"message": "Success but parsing error"}}
-                        
+                    result = response.json()
+                    success_count = sum(1 for r in result.get('results', []) if r.get('status') == 'success')
+                    logger.info(f"✓ Successfully sent batch: {success_count}/{len(batch_data)} records processed")
+                    return {"success": True, "data": result}
                 else:
                     logger.warning(f"API returned {response.status_code}: {response.text}")
                     if attempt < MAX_RETRIES - 1:
-                        logger.info(f"Retrying in {2 ** attempt} seconds...")
-                        time.sleep(2 ** attempt)
+                        time.sleep(2 ** attempt)  # Exponential backoff
                         continue
                         
             except requests.exceptions.Timeout:
@@ -193,19 +177,18 @@ class DBFUploader:
                     continue
             except Exception as e:
                 logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                logger.error(traceback.format_exc())
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue
                     
-        logger.error("Failed to send single record after all retries")
+        logger.error("✗ Failed to send batch after all retries")
         return {"success": False, "error": "Failed after retries"}
 
     def process_opro_file(self) -> Dict:
-        """Process opro.dbf file and send records to API one by one"""
+        """Process opro.dbf file and send records to API - ONLY schema matching data"""
         try:
             logger.info("=" * 60)
-            logger.info(f"PROCESSING OPRO.DBF - SINGLE RECORD TEST - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"PROCESSING OPRO.DBF - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
             start_time = time.time()
@@ -234,52 +217,97 @@ class DBFUploader:
                 logger.info("=" * 60)
                 return {"status": "completed", "changes_found": False, "records_processed": 0}
                 
-            logger.info("File has been modified - processing...")
+            logger.info("✓ File has been modified - processing...")
             
             # Open the DBF file
             logger.info(f"Opening DBF file: {OPRO_DBF_PATH}")
             dbf = DBF(OPRO_DBF_PATH, ignore_missing_memofile=True)
             
-            # Process only first few records for testing
-            records_sent = 0
-            records_processed = 0
+            # Get processed records state
+            processed_records = self.state.get('processed_records', {})
+            new_processed_records = {}
             
-            logger.info(f"Processing first {MAX_RECORDS_TO_SEND} records for testing...")
+            # Process records - ONLY schema matching data
+            all_records = []
+            record_count = 0
+            new_records = 0
+            updated_records = 0
+            
+            logger.info("Processing records (schema matching only)...")
             for record in dbf:
-                records_processed += 1
-                if records_processed > MAX_RECORDS_TO_SEND:
-                    break
-                    
+                record_count += 1
                 record_dict = dict(record)
                 
-                # Map record to API format
+                # Create record hash
+                record_hash = self.create_record_hash(record_dict)
+                if not record_hash:
+                    continue
+                    
+                # Map record to API format - ONLY schema fields
                 mapped_record = self.map_opro_record_to_api(record_dict)
                 if not mapped_record:
                     continue
+                    
+                # Check if this is a new or modified record
+                if record_hash not in processed_records:
+                    # New record
+                    logger.debug(f"  New record #{record_count}: {mapped_record.get('no_opro', 'Unknown')}")
+                    all_records.append(mapped_record)
+                    new_records += 1
+                elif processed_records[record_hash] != record_hash:
+                    # Modified record
+                    logger.debug(f"  Modified record #{record_count}: {mapped_record.get('no_opro', 'Unknown')}")
+                    all_records.append(mapped_record)
+                    updated_records += 1
+                    
+                # Store record hash
+                new_processed_records[record_hash] = record_hash
                 
-                # Send single record
-                logger.info(f"Sending record #{records_processed}")
-                result = self.send_single_record_to_api(mapped_record)
-                
-                if result.get("success"):
-                    records_sent += 1
-                    logger.info(f"Record #{records_processed} sent successfully")
-                else:
-                    logger.error(f"Failed to send record #{records_processed}: {result.get('error', 'Unknown error')}")
-                
-                # Delay between records
-                time.sleep(1)
+                # Show progress every 100 records
+                if record_count % 100 == 0:
+                    logger.info(f"  Processed {record_count} records...")
             
-            # Update file info to avoid reprocessing in next cycle
-            self.state['file_info'] = file_info
-            if self.save_state():
-                logger.info("File info updated")
+            logger.info(f"  Summary: {record_count} total, {new_records} new, {updated_records} updated")
+            
+            # Send records in batches
+            results = []
+            if all_records:
+                total_batches = ((len(all_records)-1) // BATCH_SIZE) + 1
+                logger.info(f"Sending {len(all_records)} schema-matching records in {total_batches} batches...")
+                
+                for i in range(0, len(all_records), BATCH_SIZE):
+                    batch = all_records[i:i + BATCH_SIZE]
+                    batch_index = i // BATCH_SIZE + 1
+                    logger.info(f"Sending batch {batch_index}/{total_batches} ({len(batch)} records)")
+                    
+                    batch_result = self.send_batch_to_api(batch)
+                    results.append({
+                        "batch_index": batch_index,
+                        "batch_size": len(batch),
+                        "result": batch_result
+                    })
+                    
+                    # Small delay between batches
+                    time.sleep(0.1)
+                
+                # Update state
+                self.state['processed_records'] = new_processed_records
+                self.state['file_info'] = file_info
+                if self.save_state():
+                    logger.info("State saved")
+                else:
+                    logger.error("Failed to save state")
             else:
-                logger.error("Failed to update file info")
+                logger.info("No new or modified schema-matching records to send")
+                # Still update file info to avoid reprocessing
+                self.state['file_info'] = file_info
+                if self.save_state():
+                    logger.info("File info updated")
+                else:
+                    logger.error("Failed to update file info")
             
             elapsed_time = time.time() - start_time
             logger.info(f'Processing completed in: {elapsed_time:.2f} seconds')
-            logger.info(f'Records processed: {records_processed}, Records sent: {records_sent}')
             
             logger.info("=" * 60)
             logger.info("WAITING FOR NEXT CHECK...")
@@ -287,9 +315,13 @@ class DBFUploader:
             
             return {
                 "status": "completed",
-                "records_processed": records_processed,
-                "records_sent": records_sent,
-                "processing_time": elapsed_time
+                "changes_found": True,
+                "records_processed": len(all_records),
+                "new_records": new_records,
+                "updated_records": updated_records,
+                "batches_sent": len(results),
+                "processing_time": elapsed_time,
+                "total_records": record_count
             }
             
         except Exception as e:
@@ -302,8 +334,11 @@ class DBFUploader:
         try:
             result = self.process_opro_file()
             if result.get("status") == "completed":
-                logger.info(f"Summary: {result.get('records_processed', 0)} records processed, "
-                          f"{result.get('records_sent', 0)} records sent")
+                if result.get("changes_found"):
+                    logger.info(f"Summary: {result.get('total_records', 0)} total records, "
+                              f"{result.get('new_records', 0)} new, "
+                              f"{result.get('updated_records', 0)} updated, "
+                              f"{result.get('batches_sent', 0)} batches sent")
                 return True
             else:
                 logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
@@ -315,13 +350,13 @@ class DBFUploader:
 
     def run_continuous(self) -> None:
         """Main loop that runs processing continuously"""
-        logger.info("Starting SINGLE RECORD TEST processing service...")
-        logger.info("Configuration:")
-        logger.info(f"  - API URL: {API_BASE_URL}")
+        logger.info("Starting SCHEMA-ONLY OPRO processing service...")
+        logger.info(f"Configuration:")
+        logger.info(f"  - API URL: {API_BASE_URL}{API_ENDPOINT}")
         logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
-        logger.info(f"  - Max records to send: {MAX_RECORDS_TO_SEND}")
+        logger.info(f"  - Batch size: {BATCH_SIZE} records")
         logger.info(f"  - DBF file: {OPRO_DBF_PATH}")
-        logger.info(f"  - Mode: Single record testing")
+        logger.info(f"  - Mode: Schema matching only")
         logger.info("")
         
         while True:
