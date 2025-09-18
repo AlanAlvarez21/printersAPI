@@ -101,8 +101,17 @@ class CorrectedSchemaUploader:
 
     def generate_record_hash(self, record: Dict) -> str:
         """Generate a hash for a record to detect changes"""
+        # Create a copy of the record to avoid modifying the original
+        record_copy = {}
+        for key, value in record.items():
+            # Convert date objects to strings for JSON serialization
+            if hasattr(value, 'strftime'):  # This will catch date, datetime, etc.
+                record_copy[key] = value.isoformat()
+            else:
+                record_copy[key] = value
+        
         # Create a sorted tuple of key-value pairs for consistent hashing
-        record_items = sorted(record.items())
+        record_items = sorted(record_copy.items())
         record_str = json.dumps(record_items, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(record_str.encode('utf-8')).hexdigest()
 
@@ -120,6 +129,9 @@ class CorrectedSchemaUploader:
         """Clean and convert value to appropriate type"""
         if value is None or str(value).lower() in ['nan', 'none', '']:
             return ''
+        # Handle date objects by converting them to strings
+        if hasattr(value, 'strftime'):  # This will catch date, datetime, etc.
+            return value.isoformat()
         return str(value).strip()
 
     def extract_quantity(self, record: Dict) -> int:
@@ -270,7 +282,7 @@ class CorrectedSchemaUploader:
                     "production_orders": batch_data
                 }
                 
-                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False, default=str)}")
                 
                 # Log specifically the notes values in the payload
                 for i, order in enumerate(payload.get('production_orders', [])):
