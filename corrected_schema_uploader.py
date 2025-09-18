@@ -171,9 +171,9 @@ class CorrectedSchemaUploader:
                 "ano": year,  # Using 'ano' instead of 'year' to match model field
                 
                 # Other fields that are permitted by the API
-                "status": cleaned.get('ESTATUS', ''),
                 "stat_opro": cleaned.get('STAT_OPRO', ''),
                 # Note: We're not including 'referencia' as it's not a valid column in the model
+                # Note: We're not including 'status' as it should be set by the controller to a default value
             }
             
             # Remove empty fields to keep payload clean, but keep 'notes' field even if empty
@@ -216,6 +216,14 @@ class CorrectedSchemaUploader:
                 for i, order in enumerate(payload.get('production_orders', [])):
                     if 'notes' in order:
                         logger.debug(f"Order {i} notes: '{order['notes']}'")
+                    if 'status' in order:
+                        logger.debug(f"Order {i} status: '{order['status']}'")
+                
+                # Remove any 'status' fields that are empty before sending
+                for order in payload.get('production_orders', []):
+                    if 'status' in order and not order['status']:
+                        del order['status']
+                        logger.debug(f"Removed empty status field from order {order.get('no_opro', 'unknown')}")
                 
                 response = self.session.post(
                     API_BASE_URL + API_ENDPOINT,

@@ -8,50 +8,43 @@ import json
 import hashlib
 import sys
 from typing import Dict, List, Optional, Any
-import traceback
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('final_production_uploader.log', encoding='utf-8'),
+        logging.FileHandler('corrected_schema_uploader.log', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger('FinalProductionUploader')
+logger = logging.getLogger('CorrectedSchemaUploader')
 
-# API configuration - WORKING URLs
-API_BASE_URL = "https://wmsys.fly.dev"
+# API configuration
+# API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
+API_BASE_URL = "http://localhost:3000"  # Local development URL
 API_ENDPOINT = "/api/production_orders/batch"
-API_TIMEOUT = 90  # Increased timeout for large batches
+API_TIMEOUT = 90
 MAX_RETRIES = 3
 
-# Configuration - NO LIMITS FOR PRODUCTION
-CHECK_INTERVAL = 60
-BATCH_SIZE = 30  # Smaller batches to prevent timeouts
-MAX_RECORDS_TO_PROCESS = 1000  # More than enough for 930 records
-DELAY_BETWEEN_BATCHES = 3  # Seconds between batches
+# Configuration
+BATCH_SIZE = 25
+DBF_PATH = './opro.dbf'
+STATE_FILE = "dbf_state_corrected.json"
+LAST_MODIFIED_FILE = "last_modified_state.json"
 
-# Ruta del archivo opro.dbf
-OPRO_DBF_PATH = 'C:\\\\ALPHAERP\\\\Empresas\\\\FLEXIEMP\\\\opro.dbf'
-
-# File to store last processed state
-STATE_FILE = "production_dbf_state.json"
-
-class FinalProductionUploader:
+class CorrectedSchemaUploader:
     def __init__(self):
-        self.state = self.load_state()
         self.session = requests.Session()
+        self.state = self.load_state()
+        self.last_modified_state = self.load_last_modified_state()
         
     def load_state(self) -> Dict:
         """Load the last processed state from file"""
         try:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded state with {len(state)} entries")
-                    return state
+                    return json.load(f)
         except Exception as e:
             logger.warning(f"Could not load state file: {e}")
         return {}
@@ -61,23 +54,65 @@ class FinalProductionUploader:
         try:
             with open(STATE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, indent=2, ensure_ascii=False)
-            logger.debug("State saved successfully")
             return True
         except Exception as e:
             logger.error(f"Error saving state: {e}")
             return False
 
-    def get_file_hash(self, filepath: str) -> Optional[Dict]:
-        """Get file modification time and size for change detection"""
+    def load_last_modified_state(self) -> Dict:
+        """Load the last modified timestamps from file"""
         try:
-            stat = os.stat(filepath)
-            return {
-                'mtime': stat.st_mtime,
-                'size': stat.st_size
-            }
+            if os.path.exists(LAST_MODIFIED_FILE):
+                with open(LAST_MODIFIED_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
         except Exception as e:
-            logger.error(f"Error getting file hash for {filepath}: {e}")
-            return None
+            logger.warning(f"Could not load last modified state file: {e}")
+        return {}
+
+    def save_last_modified_state(self) -> bool:
+        """Save the current last modified timestamps to file"""
+        try:
+            with open(LAST_MODIFIED_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.last_modified_state, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving last modified state: {e}")
+            return False
+
+    def get_file_last_modified(self, filepath: str) -> float:
+        """Get the last modified timestamp of a file"""
+        try:
+            return os.path.getmtime(filepath)
+        except Exception as e:
+            logger.error(f"Error getting last modified time for {filepath}: {e}")
+            return 0
+
+    def has_file_changed(self, filepath: str) -> bool:
+        """Check if a file has been modified since last check"""
+        current_modified = self.get_file_last_modified(filepath)
+        last_modified = self.last_modified_state.get(filepath, 0)
+        
+        if current_modified > last_modified:
+            self.last_modified_state[filepath] = current_modified
+            return True
+        return False
+
+    def generate_record_hash(self, record: Dict) -> str:
+        """Generate a hash for a record to detect changes"""
+        # Create a sorted tuple of key-value pairs for consistent hashing
+        record_items = sorted(record.items())
+        record_str = json.dumps(record_items, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(record_str.encode('utf-8')).hexdigest()
+
+    def has_record_changed(self, no_opro: str, record: Dict) -> bool:
+        """Check if a record has changed since last processing"""
+        record_hash = self.generate_record_hash(record)
+        last_hash = self.state.get(f"record_{no_opro}", "")
+        
+        if record_hash != last_hash:
+            self.state[f"record_{no_opro}"] = record_hash
+            return True
+        return False
 
     def clean_value(self, value: Any) -> str:
         """Clean and convert value to appropriate type"""
@@ -85,62 +120,168 @@ class FinalProductionUploader:
             return ''
         return str(value).strip()
 
-    def determine_priority(self, record: Dict) -> str:
-        """Determine priority based on status"""
-        status = record.get('OPROSTAT', '').lower()
-        
-        if 'terminada' in status or 'completada' in status:
-            return 'high'
-        elif 'cancelada' in status or 'rechazada' in status:
-            return 'low'
-        elif 'urgente' in status or 'alta' in status:
-            return 'high'
-        elif 'baja' in status:
-            return 'low'
-        else:
-            return 'medium'
-
-    def map_opro_record_to_api(self, record: Dict) -> Optional[Dict]:
-        """Map opro.dbf record to EXACT API format that works"""
+    def extract_quantity(self, record: Dict) -> int:
+        """Extract meaningful quantity from various fields"""
         try:
-            # Convert all values to strings and clean them
-            cleaned_record = {k: self.clean_value(v) for k, v in record.items()}
+            # Try different quantity fields in order of preference
+            ren_opro = self.clean_value(record.get('REN_OPRO', '0'))
+            carga_opro = self.clean_value(record.get('CARGA_OPRO', '0'))
+            cant_liq = self.clean_value(record.get('CANT_LIQ', '0'))
             
-            # Use the EXACT format that worked in your curl test
-            mapped_record = {
-                "product_id": "be08b4e8-50bb-4def-b3eb-10b23ed46faf",  # Working product_id
-                "quantity_requested": max(1, int(float(cleaned_record.get('CANT_LIQ', '0') or '0'))),
-                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Your production warehouse
-                "priority": self.determine_priority(cleaned_record),
-                "notes": cleaned_record.get('OBSERVAT', ''),
-                "no_opro": cleaned_record.get('NO_OPRO', ''),
-                "lote_referencia": cleaned_record.get('LOTE', ''),
-                "stat_opro": cleaned_record.get('OPROSTAT', ''),
+            # Use the first valid non-zero value
+            for value in [ren_opro, carga_opro, cant_liq]:
+                if value and value.lower() not in ['nan', 'none', '', '0']:
+                    try:
+                        qty = float(value)
+                        if qty > 0:
+                            return max(1, int(qty))
+                    except:
+                        continue
+                        
+            # Default quantity if nothing found
+            return 1000
+        except:
+            return 1000
+
+    def extract_year(self, record: Dict) -> str:
+        """Extract year from date field"""
+        try:
+            # Try different date fields
+            fec_opro = self.clean_value(record.get('FEC_OPRO', ''))
+            ano = self.clean_value(record.get('ANO', ''))
+            
+            # Try FEC_OPRO first
+            if fec_opro:
+                # Handle different date formats
+                if '-' in fec_opro:
+                    return fec_opro.split('-')[0]  # YYYY-MM-DD format
+                elif '/' in fec_opro:
+                    parts = fec_opro.split('/')
+                    if len(parts) == 3:
+                        # Assuming MM/DD/YYYY or DD/MM/YYYY, take the year part
+                        return parts[2] if len(parts[2]) == 4 else ''
+                elif len(fec_opro) >= 4:
+                    # Direct year format
+                    if fec_opro[:4].isdigit():
+                        return fec_opro[:4]
+            
+            # Try ANO field
+            if ano and ano.isdigit():
+                return ano
+                
+            # Default to current year
+            return str(datetime.now().year)
+        except:
+            return str(datetime.now().year)
+
+    def map_record_to_api(self, record: Dict) -> Optional[Dict]:
+        """Map DBF record to API format with CORRECT field mapping"""
+        try:
+            # Clean all values
+            cleaned = {k: self.clean_value(v) for k, v in record.items()}
+            
+            # Extract year
+            year = self.extract_year(cleaned)
+            
+            # Extract quantity
+            quantity = self.extract_quantity(cleaned)
+            
+            # Get product key - this is the main identifier
+            product_key = cleaned.get('CVE_PROP', '')
+            
+            # Validate required fields
+            no_opro = cleaned.get('NO_OPRO', '')
+            if not no_opro:
+                logger.warning("Skipping record: NO_OPRO is empty")
+                return None
+                
+            # Validate product key
+            if not product_key:
+                logger.warning(f"Record with NO_OPRO {no_opro} has empty CVE_PROP")
+                # Still process it, but log the issue
+                
+            # CORRECT mapping based on your requirements:
+            # Only include fields that are permitted by the API controller
+            mapped = {
+                # product_key is the external product identifier
+                "product_key": product_key,
+                
+                # quantity from liquidated quantity
+                "quantity_requested": quantity,
+                
+                # warehouse_id (use a valid warehouse ID)
+                # "warehouse_id": "45c4bbc8-2950-434c-b710-2ae0e080bfd1",  # local
+                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Warehouse for Flexiempaques
+                
+                # priority based on status
+                "priority": "medium",  # Default, can be adjusted
+                
+                # NO_OPRO (numero de orden de produccion)
+                "no_opro": no_opro,
+                
+                # NOTES should ONLY contain OBSERVA data
+                "notes": cleaned.get('OBSERVA', ''),
+                
+                # LOTE (lote del producto)
+                "lote_referencia": cleaned.get('LOTE', ''),
+                
+                # Year field
+                "ano": year,  # Using 'ano' instead of 'year' to match model field
+                
+                # Other fields that are permitted by the API
+                "stat_opro": cleaned.get('STAT_OPRO', ''),
+                # Note: We're not including 'referencia' as it's not a valid column in the model
+                # Note: We're not including 'status' as it should be set by the controller to a default value
             }
             
-            return mapped_record
+            # Remove empty fields to keep payload clean, but keep 'notes' field even if empty
+            mapped = {k: v for k, v in mapped.items() if v not in [None, 0] or k == 'notes'}
+            
+            # Log mapping for verification
+            logger.debug(f"Mapped record - NO_OPRO: {mapped.get('no_opro')}, "
+                        f"Product: {mapped.get('product_key')}, "
+                        f"Quantity: {mapped.get('quantity_requested')}, "
+                        f"Year: {mapped.get('ano')}, "
+                        f"Notes: '{mapped.get('notes', '')}'")
+            
+            # Log the final mapped dict for debugging
+            logger.debug(f"Final mapped dict: {mapped}")
+            
+            return mapped
             
         except Exception as e:
-            logger.error(f"Error mapping record to API schema: {e}")
+            logger.error(f"Error mapping record: {e}")
             return None
 
     def send_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of records to the API endpoint with retry logic"""
+        """Send a batch of records to the API endpoint"""
         for attempt in range(MAX_RETRIES):
             try:
-                logger.info(f"Sending batch of {len(batch_data)} records to API (attempt {attempt + 1})")
+                logger.info(f"Sending batch of {len(batch_data)} records to API")
                 
-                # Use the EXACT payload format that worked
+                # Log the first record for debugging
+                if batch_data:
+                    logger.debug(f"First record sample: {batch_data[0]}")
+                
                 payload = {
                     "company_name": "Flexiempaques",
                     "production_orders": batch_data
                 }
                 
-                # Log first record for debugging
-                if batch_data:
-                    first_record = batch_data[0]
-                    logger.info(f"First record - NO_OPRO: {first_record.get('no_opro', 'N/A')}, "
-                               f"Quantity: {first_record.get('quantity_requested', 'N/A')}")
+                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                
+                # Log specifically the notes values in the payload
+                for i, order in enumerate(payload.get('production_orders', [])):
+                    if 'notes' in order:
+                        logger.debug(f"Order {i} notes: '{order['notes']}'")
+                    if 'status' in order:
+                        logger.debug(f"Order {i} status: '{order['status']}'")
+                
+                # Remove any 'status' fields that are empty before sending
+                for order in payload.get('production_orders', []):
+                    if 'status' in order and not order['status']:
+                        del order['status']
+                        logger.debug(f"Removed empty status field from order {order.get('no_opro', 'unknown')}")
                 
                 response = self.session.post(
                     API_BASE_URL + API_ENDPOINT,
@@ -151,267 +292,169 @@ class FinalProductionUploader:
                 
                 logger.info(f"API Response Status: {response.status_code}")
                 
+                # Log response content for debugging
+                try:
+                    response_content = response.json()
+                    logger.debug(f"API Response Content: {json.dumps(response_content, indent=2)}")
+                except:
+                    logger.debug(f"API Response Text: {response.text}")
+                
                 if response.status_code == 200:
                     try:
                         result = response.json()
-                        logger.debug(f"API Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+                        success_count = result.get('success_count', 0)
+                        total_count = result.get('total_count', len(batch_data))
+                        logger.info(f"API processed batch: {success_count}/{total_count} records successful")
                         
-                        # Handle different response formats
-                        if 'success_count' in result and 'total_count' in result:
-                            success_count = result['success_count']
-                            total_count = result['total_count']
-                            logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                        elif 'results' in result:
-                            success_count = sum(1 for r in result['results'] if r.get('status') == 'success')
-                            total_count = len(result['results'])
-                            logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                            # Log any specific errors
-                            error_count = 0
-                            for i, r in enumerate(result['results']):
-                                if r.get('status') != 'success':
-                                    error_count += 1
-                                    if error_count <= 5:  # Only log first 5 errors
-                                        logger.error(f"Record {i} failed: {r.get('message', 'Unknown error')}")
-                            if error_count > 5:
-                                logger.error(f"... and {error_count - 5} more errors")
-                        else:
-                            # Assume all successful if we got 200 OK
-                            success_count = len(batch_data)
-                            total_count = len(batch_data)
-                            logger.info(f"API processed batch: {success_count}/{total_count} records successful (assumed)")
+                        # Log individual results
+                        for i, res in enumerate(result.get('results', [])):
+                            if res.get('status') == 'error':
+                                logger.warning(f"Record {i} failed: {res.get('errors', 'Unknown error')}")
                         
-                        return {"success": True, "data": result, "success_count": success_count, "total_count": total_count}
-                        
-                    except Exception as json_error:
-                        logger.error(f"Error parsing JSON response: {json_error}")
-                        logger.error(f"Response text: {response.text[:500]}...")
-                        return {"success": True, "data": {"message": "Success but parsing error"}, "success_count": len(batch_data), "total_count": len(batch_data)}
-                        
+                        return {"success": True, "data": result}
+                    except Exception as e:
+                        logger.info(f"Batch sent successfully but error parsing response: {e}")
+                        return {"success": True, "data": {}}
                 else:
-                    logger.warning(f"API returned {response.status_code}: {response.text}")
-                    if response.status_code == 422:
-                        logger.error("VALIDATION ERROR - Check payload format")
-                        if batch_data:
-                            logger.error(f"First record sample: {json.dumps(batch_data[0], indent=2, ensure_ascii=False)}")
+                    logger.warning(f"API error {response.status_code}: {response.text}")
                     if attempt < MAX_RETRIES - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                        continue
+                        time.sleep(2 ** attempt)
                         
-            except requests.exceptions.Timeout:
-                logger.warning(f"Timeout on attempt {attempt + 1} (timeout={API_TIMEOUT}s)")
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error on attempt {attempt + 1}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
             except Exception as e:
-                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error sending batch (attempt {attempt + 1}): {e}")
                 if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
+                    time.sleep(2 ** attempt)
                     
-        logger.error("Failed to send batch after all retries")
         return {"success": False, "error": "Failed after retries"}
 
-    def process_opro_file(self) -> Dict:
-        """Process opro.dbf file and send ALL records to API - NO LIMITS"""
+    def process_dbf_file(self) -> bool:
+        """Process DBF file with CORRECT schema mapping"""
         try:
             logger.info("=" * 60)
-            logger.info(f"FINAL PRODUCTION DBF PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("PROCESSING DBF WITH CORRECT SCHEMA MAPPING")
             logger.info("=" * 60)
-            logger.info("PROCESSING ALL RECORDS - NO ARTIFICIAL LIMITS")
-            
-            start_time = time.time()
             
             # Check if file exists
-            if not os.path.exists(OPRO_DBF_PATH):
-                logger.error(f"File not found: {OPRO_DBF_PATH}")
-                return {"status": "error", "message": "File not found"}
-                
-            # Check if file has changed
-            file_info = self.get_file_hash(OPRO_DBF_PATH)
-            if not file_info:
-                logger.error(f"Could not get file info for {OPRO_DBF_PATH}")
-                return {"status": "error", "message": "Could not get file info"}
-                
-            prev_file_info = self.state.get('file_info', {})
-            logger.info(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
-            logger.info(f"Previous file info: mtime={prev_file_info.get('mtime', 'None')}, size={prev_file_info.get('size', 'None')}")
-            
-            # If file hasn't changed, skip processing
-            if (file_info['mtime'] == prev_file_info.get('mtime', 0) and 
-                file_info['size'] == prev_file_info.get('size', 0)):
-                logger.info("No changes in opro.dbf file")
-                logger.info("=" * 60)
-                logger.info("WAITING FOR NEXT CHECK...")
-                logger.info("=" * 60)
-                return {"status": "completed", "changes_found": False, "records_processed": 0}
-                
-            logger.info("File has been modified - processing ALL records...")
-            
-            # Open the DBF file
-            logger.info(f"Opening DBF file: {OPRO_DBF_PATH}")
-            dbf = DBF(OPRO_DBF_PATH, ignore_missing_memofile=True)
-            
-            # Process ALL records - NO ARTIFICIAL LIMIT
-            all_records = []
-            record_count = 0
-            
-            logger.info("Processing ALL records from DBF file...")
-            for record in dbf:
-                record_count += 1
-                record_dict = dict(record)
-                
-                # Map record to API format
-                mapped_record = self.map_opro_record_to_api(record_dict)
-                if mapped_record:
-                    all_records.append(mapped_record)
-                
-                # Show progress every 100 records
-                if record_count % 100 == 0:
-                    logger.info(f"Processed {record_count} records...")
-            
-            logger.info(f"TOTAL records prepared: {len(all_records)} (out of {record_count} in file)")
-            
-            # Send ALL records in batches
-            if all_records:
-                total_batches = ((len(all_records)-1) // BATCH_SIZE) + 1
-                logger.info(f"Sending {len(all_records)} records in {total_batches} batches of {BATCH_SIZE} each")
-                
-                successful_sends = 0
-                total_sent = 0
-                failed_batches = 0
-                
-                for i in range(0, len(all_records), BATCH_SIZE):
-                    batch = all_records[i:i + BATCH_SIZE]
-                    batch_index = i // BATCH_SIZE + 1
-                    logger.info(f"Sending batch {batch_index}/{total_batches} ({len(batch)} records)")
-                    
-                    batch_result = self.send_batch_to_api(batch)
-                    
-                    if batch_result.get("success"):
-                        successful_sends += batch_result.get("success_count", 0)
-                        total_sent += batch_result.get("total_count", len(batch))
-                        logger.info(f"Batch {batch_index} completed: {batch_result.get('success_count', 0)}/{batch_result.get('total_count', len(batch))} successful")
-                    else:
-                        failed_batches += 1
-                        logger.error(f"Batch {batch_index} failed: {batch_result.get('error', 'Unknown error')}")
-                    
-                    # Delay between batches to prevent API overload
-                    if batch_index < total_batches:
-                        logger.info(f"Waiting {DELAY_BETWEEN_BATCHES} seconds before next batch...")
-                        time.sleep(DELAY_BETWEEN_BATCHES)
-                
-                logger.info(f"FINAL RESULT: {successful_sends}/{total_sent} records sent successfully")
-                if failed_batches > 0:
-                    logger.warning(f"Failed batches: {failed_batches}/{total_batches}")
-                
-                # Update state
-                self.state['file_info'] = file_info
-                if self.save_state():
-                    logger.info("State saved")
-                else:
-                    logger.error("Failed to save state")
-            else:
-                logger.info("No valid records to send")
-                # Still update file info
-                self.state['file_info'] = file_info
-                if self.save_state():
-                    logger.info("File info updated")
-                else:
-                    logger.error("Failed to update file info")
-            
-            elapsed_time = time.time() - start_time
-            logger.info(f'Processing completed in: {elapsed_time:.2f} seconds')
-            
-            logger.info("=" * 60)
-            logger.info("WAITING FOR NEXT CHECK...")
-            logger.info("=" * 60)
-            
-            return {
-                "status": "completed",
-                "records_processed": len(all_records),
-                "total_records_in_file": record_count,
-                "successful_sends": successful_sends,
-                "total_sent": total_sent,
-                "failed_batches": failed_batches,
-                "processing_time": elapsed_time
-            }
-            
-        except Exception as e:
-            logger.error(f"Critical error in process_opro_file: {e}")
-            logger.error(traceback.format_exc())
-            return {"status": "error", "message": str(e)}
-
-    def run_once(self) -> bool:
-        """Run processing once and return success status"""
-        try:
-            result = self.process_opro_file()
-            if result.get("status") == "completed":
-                logger.info(f"Summary: {result.get('records_processed', 0)} records processed")
-                logger.info(f"Total in file: {result.get('total_records_in_file', 0)} records")
-                if 'successful_sends' in result:
-                    logger.info(f"Successfully sent: {result.get('successful_sends', 0)}/{result.get('total_sent', 0)} records")
-                    if result.get('failed_batches', 0) > 0:
-                        logger.warning(f"Failed batches: {result.get('failed_batches', 0)}")
-                return True
-            else:
-                logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
+            if not os.path.exists(DBF_PATH):
+                logger.error(f"File not found: {DBF_PATH}")
                 return False
-        except Exception as e:
-            logger.error(f"Error in run_once: {e}")
-            logger.error(traceback.format_exc())
-            return False
-
-    def run_continuous(self) -> None:
-        """Main loop that runs processing continuously"""
-        logger.info("Starting FINAL PRODUCTION DBF processing service...")
-        logger.info("Configuration:")
-        logger.info(f"  - API URL: {API_BASE_URL}{API_ENDPOINT}")
-        logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
-        logger.info(f"  - Batch size: {BATCH_SIZE} records")
-        logger.info(f"  - NO ARTIFICIAL LIMITS - Processing ALL records")
-        logger.info(f"  - API timeout: {API_TIMEOUT} seconds")
-        logger.info(f"  - Delay between batches: {DELAY_BETWEEN_BATCHES} seconds")
-        logger.info(f"  - DBF file: {OPRO_DBF_PATH}")
-        logger.info("")
-        
-        while True:
-            try:
-                success = self.run_once()
-                logger.info(f"Sleeping for {CHECK_INTERVAL} seconds...")
-                time.sleep(CHECK_INTERVAL)
                 
-            except KeyboardInterrupt:
-                logger.info("Stopping automatic processing service...")
-                break
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                logger.error(traceback.format_exc())
-                logger.info("Continuing...")
-                time.sleep(CHECK_INTERVAL)
+            # Check if DBF file has been modified
+            if not self.has_file_changed(DBF_PATH):
+                logger.info("No changes detected in DBF file")
+                # Also check for FPT file if it exists
+                fpt_path = DBF_PATH.replace('.dbf', '.fpt')
+                if os.path.exists(fpt_path) and self.has_file_changed(fpt_path):
+                    logger.info("Changes detected in FPT file")
+                else:
+                    # Save state to persist last modified times
+                    self.save_last_modified_state()
+                    return True
+                
+            # Open DBF file with memo support
+            logger.info(f"Opening DBF file: {DBF_PATH}")
+            dbf = DBF(DBF_PATH, ignore_missing_memofile=False)
+            
+            # Process records
+            all_records = []
+            processed_count = 0
+            changed_records_count = 0
+            
+            for record in dbf:
+                record_dict = dict(record)
+                no_opro = self.clean_value(record_dict.get('NO_OPRO', ''))
+                
+                # Skip records without NO_OPRO
+                if not no_opro:
+                    continue
+                
+                # Check if record has changed
+                if self.has_record_changed(no_opro, record_dict):
+                    changed_records_count += 1
+                    mapped_record = self.map_record_to_api(record_dict)
+                    if mapped_record:
+                        all_records.append(mapped_record)
+                        processed_count += 1
+                        
+                        # Log progress every 100 records
+                        if processed_count % 100 == 0:
+                            logger.info(f"Processed {processed_count} records so far...")
+                else:
+                    # Record hasn't changed, skip it
+                    continue
+            
+            logger.info(f"Found {changed_records_count} changed records, prepared {len(all_records)} valid records for sending")
+            
+            if not all_records:
+                logger.info("No changed records to send")
+                # Save state to persist last modified times and record hashes
+                self.save_state()
+                self.save_last_modified_state()
+                return True
+            
+            # Send in batches
+            successful_sends = 0
+            total_records = len(all_records)
+            
+            for i in range(0, len(all_records), BATCH_SIZE):
+                batch = all_records[i:i + BATCH_SIZE]
+                logger.info(f"Processing batch {i//BATCH_SIZE + 1} ({len(batch)} records)")
+                batch_result = self.send_batch_to_api(batch)
+                if batch_result.get("success"):
+                    result_data = batch_result.get("data", {})
+                    success_count = result_data.get('success_count', len(batch))
+                    successful_sends += success_count
+                    logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {success_count} records successful")
+                else:
+                    logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error')}")
+            
+            logger.info(f"Total records sent: {successful_sends}/{total_records}")
+            
+            # Save state to persist last modified times and record hashes
+            self.save_state()
+            self.save_last_modified_state()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error processing DBF file: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
 
 def main():
     """Main function"""
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        uploader = FinalProductionUploader()
-        success = uploader.run_once()
-        sys.exit(0 if success else 1)
-    else:
-        uploader = FinalProductionUploader()
-        uploader.run_continuous()
+    logger.info("Starting CORRECTED SCHEMA DBF Uploader")
+    
+    uploader = CorrectedSchemaUploader()
+    
+    # Run in continuous mode
+    while True:
+        try:
+            logger.info("Checking for DBF file updates...")
+            success = uploader.process_dbf_file()
+            
+            if success:
+                logger.info("Upload cycle completed successfully!")
+            else:
+                logger.error("Upload cycle failed!")
+                
+            # Wait before next check (30 seconds)
+            logger.info("Waiting 30 seconds before next check...")
+            time.sleep(30)
+            
+        except KeyboardInterrupt:
+            logger.info("Upload process interrupted by user")
+            # Save state before exiting
+            uploader.save_state()
+            uploader.save_last_modified_state()
+            break
+        except Exception as e:
+            logger.error(f"Error in upload cycle: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # Wait before retrying after error
+            time.sleep(30)
 
 if __name__ == '__main__':
     main()
