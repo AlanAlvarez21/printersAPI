@@ -33,9 +33,22 @@ MAX_RETRIES = 3
 
 # Configuration
 BATCH_SIZE = 25
-DBF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'opro.dbf') if os.path.dirname(os.path.abspath(__file__)) else './opro.dbf'
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbf_state_corrected.json") if os.path.dirname(os.path.abspath(__file__)) else "dbf_state_corrected.json"
-LAST_MODIFIED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_modified_state.json") if os.path.dirname(os.path.abspath(__file__)) else "last_modified_state.json"
+# Configuration for file paths
+BATCH_SIZE = 25
+
+# For PyInstaller compatibility, we need to handle the _MEIPASS path
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable
+    application_path = sys._MEIPASS
+    # For Windows executable, look for opro.dbf in the AlphaERP directory
+    DBF_PATH = r"C:\ALPHAERP\Empresas\FLEXIEMP\opro.dbf"
+else:
+    # Running as script
+    application_path = os.path.dirname(os.path.abspath(__file__))
+    DBF_PATH = os.path.join(application_path, 'opro.dbf')
+
+STATE_FILE = os.path.join(application_path, "dbf_state_corrected.json")
+LAST_MODIFIED_FILE = os.path.join(application_path, "last_modified_state.json")
 
 class CorrectedSchemaUploader:
     def __init__(self):
