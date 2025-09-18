@@ -12,11 +12,13 @@ from typing import Dict, List, Optional, Any
 # Configure logging
 # Use a relative path for the log file to avoid permission issues
 log_filename = 'corrected_schema_uploader.log'
+# Ensure we're using the correct path separator for the current platform
+log_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_filename) if os.path.dirname(os.path.abspath(__file__)) else log_filename
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.FileHandler(log_filepath, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -31,9 +33,9 @@ MAX_RETRIES = 3
 
 # Configuration
 BATCH_SIZE = 25
-DBF_PATH = './opro.dbf'
-STATE_FILE = "dbf_state_corrected.json"
-LAST_MODIFIED_FILE = "last_modified_state.json"
+DBF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'opro.dbf') if os.path.dirname(os.path.abspath(__file__)) else './opro.dbf'
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbf_state_corrected.json") if os.path.dirname(os.path.abspath(__file__)) else "dbf_state_corrected.json"
+LAST_MODIFIED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_modified_state.json") if os.path.dirname(os.path.abspath(__file__)) else "last_modified_state.json"
 
 class CorrectedSchemaUploader:
     def __init__(self):
@@ -440,12 +442,30 @@ def main():
     """Main function"""
     logger.info("Starting CORRECTED SCHEMA DBF Uploader")
     
+    # Check if force send flag is set
+    force_send = '--force-send' in sys.argv
+    
+    # Check if clear state flag is set
+    if '--clear-state' in sys.argv:
+        logger.info("Clearing state file...")
+        state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE) if os.path.dirname(os.path.abspath(__file__)) else STATE_FILE
+        if os.path.exists(state_file):
+            os.remove(state_file)
+            logger.info("State file cleared")
+        else:
+            logger.info("State file not found")
+    
     uploader = CorrectedSchemaUploader()
     
     # Run in continuous mode
     while True:
         try:
             logger.info("Checking for DBF file updates...")
+            if force_send:
+                logger.info("Force send mode enabled - sending all records")
+                # Temporarily clear the state to force sending all records
+                uploader.state = {}
+            
             success = uploader.process_dbf_file()
             
             if success:
