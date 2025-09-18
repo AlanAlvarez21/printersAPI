@@ -10,19 +10,21 @@ import sys
 from typing import Dict, List, Optional, Any
 
 # Configure logging
+# Use a relative path for the log file to avoid permission issues
+log_filename = 'corrected_schema_uploader.log'
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('corrected_schema_uploader.log', encoding='utf-8'),
+        logging.FileHandler(log_filename, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger('CorrectedSchemaUploader')
 
 # API configuration
-# API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
-API_BASE_URL = "http://localhost:3000"  # Local development URL
+API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
+# API_BASE_URL = "http://localhost:3000"  # Local development URL
 API_ENDPOINT = "/api/production_orders/batch"
 API_TIMEOUT = 90
 MAX_RETRIES = 3
