@@ -8,60 +8,46 @@ import json
 import hashlib
 import sys
 from typing import Dict, List, Optional, Any
+import traceback
 
 # Configure logging
-# Use a relative path for the log file to avoid permission issues
-log_filename = 'corrected_schema_uploader.log'
-# Ensure we're using the correct path separator for the current platform
-log_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_filename) if os.path.dirname(os.path.abspath(__file__)) else log_filename
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filepath, encoding='utf-8'),
+        logging.FileHandler('ordprod_inventory_uploader.log', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger('CorrectedSchemaUploader')
-logger = logging.getLogger('CorrectedSchemaUploader')
+logger = logging.getLogger('OrdProdInventoryUploader')
 
-# API configuration
-API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
-# API_BASE_URL = "http://localhost:3000"  # Local development URL
-API_ENDPOINT = "/api/production_orders/batch"
-API_TIMEOUT = 90
+# API configuration - Using the correct endpoint from your example
+API_BASE_URL = "https://wmsys.fly.dev"  # Local development URL like in your example
+INVENTORY_CODES_ENDPOINT = "/api/inventory_codes"
+API_TIMEOUT = 30
 MAX_RETRIES = 3
 
-# Configuration
-BATCH_SIZE = 25
-# Configuration for file paths
-BATCH_SIZE = 25
+# Configuration - Remove the artificial limit
+CHECK_INTERVAL = 60
+BATCH_SIZE = 50
+MAX_RECORDS_TO_PROCESS = float('inf')  # No limit - process all records
 
-# For PyInstaller compatibility, we need to handle the _MEIPASS path
-if getattr(sys, 'frozen', False):
-    # Running as compiled executable
-    application_path = sys._MEIPASS
-    # For Windows executable, look for opro.dbf in the AlphaERP directory
-    DBF_PATH = r"C:\ALPHAERP\Empresas\FLEXIEMP\opro.dbf"
-else:
-    # Running as script
-    application_path = os.path.dirname(os.path.abspath(__file__))
-    DBF_PATH = os.path.join(application_path, 'opro.dbf')
+# Ruta del archivo ordprod.dbf
+ORDPROD_DBF_PATH = 'ordprod.dbf'
 
-# Use a single state file for all environments
-STATE_FILE = os.path.join(application_path, "dbf_state_corrected.json")
-LAST_MODIFIED_FILE = os.path.join(application_path, "last_modified_state.json")
+# File to store last processed state
+STATE_FILE = "ordprod_inventory_state.json"
 
-class CorrectedSchemaUploader:
+# Flag to force processing even if file hasn't changed (for testing)
+FORCE_PROCESSING = "--force" in sys.argv
+
+class OrdProdInventoryUploader:
     def __init__(self):
-        self.session = requests.Session()
         self.state = self.load_state()
-        self.last_modified_state = self.load_last_modified_state()
-        # Check if this is the first run
-        self.first_run = not os.path.exists(STATE_FILE) and not os.path.exists(LAST_MODIFIED_FILE)
-        # Initialize with a default starting NO_OPRO if not set, based on user requirement starting at 936
-        if 'last_processed_opro' not in self.state:
-            self.state['last_processed_opro'] = 936  # Starting from the specified value
+        self.session = requests.Session()
+        # Initialize with a default starting NO_ORDP if not set
+        if 'last_processed_ordp' not in self.state:
+            self.state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
         
     def load_state(self) -> Dict:
         """Load the last processed state from file"""
@@ -69,249 +55,109 @@ class CorrectedSchemaUploader:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, 'r', encoding='utf-8') as f:
                     state = json.load(f)
-                    # Set default last_processed_opro if not present
-                    if 'last_processed_opro' not in state:
-                        state['last_processed_opro'] = 936  # Starting from the specified value
+                    logger.info(f"Loaded state with {len(state)} entries")
+                    # Set default last_processed_ordp if not present
+                    if 'last_processed_ordp' not in state:
+                        state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
                     return state
         except Exception as e:
             logger.warning(f"Could not load state file: {e}")
-        # Default state with starting NO_OPRO
-        return {'last_processed_opro': 936}
+        # Default state with starting NO_ORDP
+        return {'last_processed_ordp': 0}
 
     def save_state(self) -> bool:
         """Save the current state to file"""
         try:
             with open(STATE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, indent=2, ensure_ascii=False)
+            logger.debug("State saved successfully")
             return True
         except Exception as e:
             logger.error(f"Error saving state: {e}")
             return False
 
-    def load_last_modified_state(self) -> Dict:
-        """Load the last modified timestamps from file"""
+    def is_new_record(self, no_ordp: str) -> bool:
+        """Check if this is a new record based on NO_ORDP sequence"""
         try:
-            if os.path.exists(LAST_MODIFIED_FILE):
-                with open(LAST_MODIFIED_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load last modified state file: {e}")
-        return {}
-
-    def save_last_modified_state(self) -> bool:
-        """Save the current last modified timestamps to file"""
-        try:
-            with open(LAST_MODIFIED_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.last_modified_state, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            logger.error(f"Error saving last modified state: {e}")
-            return False
-
-    def get_file_last_modified(self, filepath: str) -> float:
-        """Get the last modified timestamp of a file"""
-        try:
-            return os.path.getmtime(filepath)
-        except Exception as e:
-            logger.error(f"Error getting last modified time for {filepath}: {e}")
-            return 0
-
-    def has_file_changed(self, filepath: str) -> bool:
-        """Check if a file has been modified since last check"""
-        current_modified = self.get_file_last_modified(filepath)
-        last_modified = self.last_modified_state.get(filepath, 0)
-        
-        if current_modified > last_modified:
-            self.last_modified_state[filepath] = current_modified
-            return True
-        return False
-
-    
-
-    def is_new_record(self, no_opro: str) -> bool:
-        """Check if this is a new record based on NO_OPRO sequence"""
-        try:
-            current_opro = int(no_opro)
-            last_processed = self.state.get('last_processed_opro', 936)
-            return current_opro > last_processed
+            current_ordp = int(no_ordp)
+            last_processed = self.state.get('last_processed_ordp', 0)
+            return current_ordp > last_processed
         except ValueError:
-            logger.warning(f"Invalid NO_OPRO value: {no_opro}")
+            logger.warning(f"Invalid NO_ORDP value: {no_ordp}")
             return False
+
+    def get_file_hash(self, filepath: str) -> Optional[Dict]:
+        """Get file modification time and size for change detection"""
+        try:
+            stat = os.stat(filepath)
+            return {
+                'mtime': stat.st_mtime,
+                'size': stat.st_size
+            }
+        except Exception as e:
+            logger.error(f"Error getting file hash for {filepath}: {e}")
+            return None
 
     def clean_value(self, value: Any) -> str:
         """Clean and convert value to appropriate type"""
-        if value is None or str(value).lower() in ['nan', 'none', '']:
+        if value is None or str(value).lower() in ['nan', 'none', '', 'null']:
             return ''
-        # Handle date objects by converting them to strings
-        if hasattr(value, 'strftime'):  # This will catch date, datetime, etc.
-            return value.isoformat()
         return str(value).strip()
 
-    def extract_quantity(self, record: Dict) -> int:
-        """Extract meaningful quantity from various fields"""
+    def map_ordprod_record_to_inventory_code(self, record: Dict) -> Optional[Dict]:
+        """Map ordprod.dbf record to inventory code API format"""
         try:
-            # Try different quantity fields in order of preference
-            ren_opro = self.clean_value(record.get('REN_OPRO', '0'))
-            carga_opro = self.clean_value(record.get('CARGA_OPRO', '0'))
-            cant_liq = self.clean_value(record.get('CANT_LIQ', '0'))
+            # Convert all values to strings and clean them
+            cleaned_record = {k: self.clean_value(v) for k, v in record.items()}
             
-            # Use the first valid non-zero value
-            for value in [ren_opro, carga_opro, cant_liq]:
-                if value and value.lower() not in ['nan', 'none', '', '0']:
-                    try:
-                        qty = float(value)
-                        if qty > 0:
-                            return max(1, int(qty))
-                    except:
-                        continue
-                        
-            # Default quantity if nothing found
-            return 1000
-        except:
-            return 1000
-
-    def extract_year(self, record: Dict) -> str:
-        """Extract year from date field"""
-        try:
-            # Try different date fields
-            fec_opro = self.clean_value(record.get('FEC_OPRO', ''))
-            ano = self.clean_value(record.get('ANO', ''))
-            
-            # Try FEC_OPRO first
-            if fec_opro:
-                # Handle different date formats
-                if '-' in fec_opro:
-                    return fec_opro.split('-')[0]  # YYYY-MM-DD format
-                elif '/' in fec_opro:
-                    parts = fec_opro.split('/')
-                    if len(parts) == 3:
-                        # Assuming MM/DD/YYYY or DD/MM/YYYY, take the year part
-                        return parts[2] if len(parts[2]) == 4 else ''
-                elif len(fec_opro) >= 4:
-                    # Direct year format
-                    if fec_opro[:4].isdigit():
-                        return fec_opro[:4]
-            
-            # Try ANO field
-            if ano and ano.isdigit():
-                return ano
-                
-            # Default to current year
-            return str(datetime.now().year)
-        except:
-            return str(datetime.now().year)
-
-    def map_record_to_api(self, record: Dict) -> Optional[Dict]:
-        """Map DBF record to API format with CORRECT field mapping"""
-        try:
-            # Clean all values
-            cleaned = {k: self.clean_value(v) for k, v in record.items()}
-            
-            # Extract year
-            year = self.extract_year(cleaned)
-            
-            # Extract quantity
-            quantity = self.extract_quantity(cleaned)
-            
-            # Get product key - this is the main identifier
-            product_key = cleaned.get('CVE_PROP', '')
-            
-            # Validate required fields
-            no_opro = cleaned.get('NO_OPRO', '')
-            if not no_opro:
-                logger.warning("Skipping record: NO_OPRO is empty")
-                return None
-                
-            # Validate product key
-            if not product_key:
-                logger.warning(f"Record with NO_OPRO {no_opro} has empty CVE_PROP")
-                # Still process it, but log the issue
-                
-            # CORRECT mapping based on your requirements:
-            # Only include fields that are permitted by the API controller
-            mapped = {
-                # product_key is the external product identifier
-                "product_key": product_key,
-                
-                # quantity from liquidated quantity
-                "quantity_requested": quantity,
-                
-                # warehouse_id (use a valid warehouse ID)
-                # "warehouse_id": "45c4bbc8-2950-434c-b710-2ae0e080bfd1",  # local
-                "warehouse_id": "1ac67bd3-d5b1-4bbb-9f33-31d4a71af536",  # Warehouse for Flexiempaques
-                
-                # priority based on status
-                "priority": "medium",  # Default, can be adjusted
-                
-                # NO_OPRO (numero de orden de produccion)
-                "no_opro": no_opro,
-                
-                # NOTES should ONLY contain OBSERVA data
-                "notes": cleaned.get('OBSERVA', ''),
-                
-                # LOTE (lote del producto)
-                "lote_referencia": cleaned.get('LOTE', ''),
-                
-                # Year field
-                "ano": year,  # Using 'ano' instead of 'year' to match model field
-                
-                # Other fields that are permitted by the API
-                "stat_opro": cleaned.get('STAT_OPRO', ''),
-                # Note: We're not including 'referencia' as it's not a valid column in the model
-                # Note: We're not including 'status' as it should be set by the controller to a default value
+            # Map ordprod fields to inventory code fields based on your example
+            mapped_record = {
+                "no_ordp": cleaned_record.get('NO_ORDP', ''),
+                "cve_copr": cleaned_record.get('CVE_COPR', ''),
+                "cve_prod": cleaned_record.get('CVE_PROD', ''),
+                "can_copr": float(cleaned_record.get('CAN_COPR', 0) or 0),
+                "tip_copr": int(float(cleaned_record.get('TIP_COPR', 1) or 1)),
+                "costo": float(cleaned_record.get('COSTO', 0) or 0),
+                "fecha": cleaned_record.get('FECH_CTO', datetime.now().strftime('%Y-%m-%d')),
+                "cve_suc": cleaned_record.get('CVE_SUC', ''),
+                "trans": int(float(cleaned_record.get('TRANS', 0) or 0)),
+                "lote": cleaned_record.get('LOTE', ''),
+                "new_med": cleaned_record.get('NEW_MED', ''),
+                "new_copr": cleaned_record.get('NEW_COPR', ''),
+                "costo_rep": float(cleaned_record.get('COSTO_REP', 0) or 0),
+                "partresp": int(float(cleaned_record.get('PARTRESP', 0) or 0)),
+                "dmov": cleaned_record.get('DMOV', ''),
+                "partop": int(float(cleaned_record.get('PARTOP', 0) or 0)),
+                "fcdres": float(cleaned_record.get('FCDRES', 0) or 0),
+                "undres": cleaned_record.get('UNDRES', ''),
             }
             
-            # Remove empty fields to keep payload clean, but keep 'notes' field even if empty
-            mapped = {k: v for k, v in mapped.items() if v not in [None, 0] or k == 'notes'}
+            # Remove empty fields to keep payload clean
+            mapped_record = {k: v for k, v in mapped_record.items() 
+                           if v not in [None, '', 0] or k in ['can_copr', 'costo', 'tip_copr', 'trans', 'partresp', 'partop', 'fcdres']}
             
-            # Log mapping for verification
-            logger.debug(f"Mapped record - NO_OPRO: {mapped.get('no_opro')}, "
-                        f"Product: {mapped.get('product_key')}, "
-                        f"Quantity: {mapped.get('quantity_requested')}, "
-                        f"Year: {mapped.get('ano')}, "
-                        f"Notes: '{mapped.get('notes', '')}'")
-            
-            # Log the final mapped dict for debugging
-            logger.debug(f"Final mapped dict: {mapped}")
-            
-            return mapped
+            return mapped_record
             
         except Exception as e:
-            logger.error(f"Error mapping record: {e}")
+            logger.error(f"Error mapping record to inventory code schema: {e}")
+            logger.error(f"Record data: {record}")
             return None
 
-    def send_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of records to the API endpoint"""
+    def send_inventory_code_to_api(self, inventory_code_data: Dict) -> Dict:
+        """Send a single inventory code to the API endpoint with retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
-                logger.info(f"Sending batch of {len(batch_data)} records to API")
+                logger.info(f"Sending inventory code NO_ORDP: {inventory_code_data.get('no_ordp', 'N/A')} to API (attempt {attempt + 1})")
                 
-                # Log the first record for debugging
-                if batch_data:
-                    logger.debug(f"First record sample: {batch_data[0]}")
-                
+                # Wrap the inventory code data in the expected format (as per your example)
                 payload = {
-                    "company_name": "Flexiempaques",
-                    "production_orders": batch_data
+                    "inventory_code": inventory_code_data
                 }
                 
-                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False, default=str)}")
-                
-                # Log specifically the notes values in the payload
-                for i, order in enumerate(payload.get('production_orders', [])):
-                    if 'notes' in order:
-                        logger.debug(f"Order {i} notes: '{order['notes']}'")
-                    if 'status' in order:
-                        logger.debug(f"Order {i} status: '{order['status']}'")
-                
-                # Remove any 'status' fields that are empty before sending
-                for order in payload.get('production_orders', []):
-                    if 'status' in order and not order['status']:
-                        del order['status']
-                        logger.debug(f"Removed empty status field from order {order.get('no_opro', 'unknown')}")
+                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}...")
                 
                 response = self.session.post(
-                    API_BASE_URL + API_ENDPOINT,
+                    API_BASE_URL + INVENTORY_CODES_ENDPOINT,
                     json=payload,
                     headers={'Content-Type': 'application/json'},
                     timeout=API_TIMEOUT
@@ -319,270 +165,346 @@ class CorrectedSchemaUploader:
                 
                 logger.info(f"API Response Status: {response.status_code}")
                 
-                # Log response content for debugging
-                try:
-                    response_content = response.json()
-                    logger.debug(f"API Response Content: {json.dumps(response_content, indent=2)}")
-                except:
-                    logger.debug(f"API Response Text: {response.text}")
-                
-                if response.status_code == 200:
+                if response.status_code in [200, 201]:
                     try:
                         result = response.json()
-                        success_count = result.get('success_count', 0)
-                        total_count = result.get('total_count', len(batch_data))
-                        logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                        
-                        # Log individual results
-                        for i, res in enumerate(result.get('results', [])):
-                            if res.get('status') == 'error':
-                                logger.warning(f"Record {i} failed: {res.get('errors', 'Unknown error')}")
-                        
+                        logger.debug(f"API Response: {json.dumps(result, indent=2, ensure_ascii=False)[:500]}...")
+                        logger.info(f"Inventory code sent successfully")
                         return {"success": True, "data": result}
-                    except Exception as e:
-                        logger.info(f"Batch sent successfully but error parsing response: {e}")
-                        return {"success": True, "data": {}}
+                    except Exception as json_error:
+                        logger.error(f"Error parsing JSON response: {json_error}")
+                        logger.error(f"Response text: {response.text[:500]}...")
+                        return {"success": True, "data": {"message": "Success but parsing error"}}
+                elif response.status_code == 409:
+                    # Conflict - inventory code already exists
+                    logger.warning(f"Inventory code already exists: {inventory_code_data.get('no_ordp', 'N/A')}")
+                    return {"success": True, "data": {"message": "Already exists"}}
                 else:
-                    logger.warning(f"API error {response.status_code}: {response.text}")
+                    logger.warning(f"API returned {response.status_code}: {response.text}")
+                    if response.status_code == 422:
+                        logger.error("VALIDATION ERROR - Check payload format")
+                        logger.error(f"Full payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(2 ** attempt)
+                        continue
                         
-            except Exception as e:
-                logger.error(f"Error sending batch (attempt {attempt + 1}): {e}")
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout on attempt {attempt + 1}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
+                    continue
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error on attempt {attempt + 1}: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+            except Exception as e:
+                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                logger.error(traceback.format_exc())
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                     
+        logger.error("Failed to send inventory code after all retries")
         return {"success": False, "error": "Failed after retries"}
 
-    def process_dbf_file(self) -> bool:
-        """Process DBF file with CORRECT schema mapping"""
+    def send_inventory_codes_batch_to_api(self, batch_data: List[Dict]) -> Dict:
+        """Send a batch of inventory codes to the API endpoint - fallback to individual sends if no batch endpoint exists"""
+        # First try the batch endpoint if it exists
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(f"Sending batch of {len(batch_data)} inventory codes to API")
+                
+                # Create a payload with the batch of inventory codes
+                payload = {
+                    "inventory_codes": batch_data
+                }
+                
+                logger.debug(f"Batch payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}...")
+                
+                response = self.session.post(
+                    API_BASE_URL + INVENTORY_CODES_ENDPOINT + "/batch",  # Try batch endpoint first
+                    json=payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=API_TIMEOUT * 2  # Increase timeout for batch processing
+                )
+                
+                logger.info(f"API Response Status: {response.status_code}")
+                
+                if response.status_code in [200, 201]:
+                    try:
+                        result = response.json()
+                        success_count = result.get('success_count', len(batch_data))
+                        total_count = result.get('total_count', len(batch_data))
+                        logger.info(f"API processed batch: {success_count}/{total_count} records successful")
+                        return {"success": True, "data": result}
+                    except Exception as json_error:
+                        logger.error(f"Error parsing JSON response: {json_error}")
+                        logger.error(f"Response text: {response.text[:500]}...")
+                        return {"success": True, "data": {"message": "Success but parsing error"}}
+                elif response.status_code == 404:
+                    logger.info("Batch endpoint not found, falling back to individual sends")
+                    break  # Break to fallback to individual sends
+                else:
+                    logger.warning(f"API batch returned {response.status_code}: {response.text}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                        
+            except requests.exceptions.Timeout:
+                logger.warning(f"Batch timeout on attempt {attempt + 1}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Batch request error on attempt {attempt + 1}: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+            except Exception as e:
+                logger.error(f"Unexpected batch error on attempt {attempt + 1}: {e}")
+                logger.error(traceback.format_exc())
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+        
+        # If batch endpoint doesn't exist or failed, fall back to sending individually
+        logger.info("Falling back to individual sends for batch...")
+        successful_sends = 0
+        results = []
+        
+        for inventory_code_data in batch_data:
+            result = self.send_inventory_code_to_api(inventory_code_data)
+            if result.get("success"):
+                successful_sends += 1
+            results.append(result)
+        
+        return {
+            "success": True,
+            "data": {
+                "success_count": successful_sends,
+                "total_count": len(batch_data),
+                "results": results
+            }
+        }
+
+    def process_ordprod_file(self) -> Dict:
+        """Process ordprod.dbf file and send records as inventory codes to API"""
         try:
             logger.info("=" * 60)
-            logger.info("PROCESSING DBF WITH CORRECT SCHEMA MAPPING")
+            logger.info(f"ORDPROD INVENTORY CODES PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
+            start_time = time.time()
+            
             # Check if file exists
-            if not os.path.exists(DBF_PATH):
-                logger.error(f"File not found: {DBF_PATH}")
-                return False
+            if not os.path.exists(ORDPROD_DBF_PATH):
+                logger.error(f"File not found: {ORDPROD_DBF_PATH}")
+                return {"status": "error", "message": "File not found"}
                 
-            # Check if DBF file has been modified
-            if not self.first_run and not self.has_file_changed(DBF_PATH):
-                logger.info("No changes detected in DBF file")
-                # Also check for FPT file if it exists
-                fpt_path = DBF_PATH.replace('.dbf', '.fpt')
-                if os.path.exists(fpt_path) and self.has_file_changed(fpt_path):
-                    logger.info("Changes detected in FPT file")
-                else:
-                    # Save state to persist last modified times
-                    self.save_last_modified_state()
-                    return True
-            
-            if self.first_run:
-                logger.info("First run detected - will process all records")
+            # Check if file has changed
+            file_info = self.get_file_hash(ORDPROD_DBF_PATH)
+            if not file_info:
+                logger.error(f"Could not get file info for {ORDPROD_DBF_PATH}")
+                return {"status": "error", "message": "Could not get file info"}
                 
-            # Open DBF file with memo support
-            logger.info(f"Opening DBF file: {DBF_PATH}")
-            dbf = DBF(DBF_PATH, ignore_missing_memofile=False)
+            prev_file_info = self.state.get('file_info', {})
+            logger.info(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
+            logger.info(f"Previous file info: mtime={prev_file_info.get('mtime', 'None')}, size={prev_file_info.get('size', 'None')}")
             
-            # Process records based on NO_OPRO sequence
+            # If file hasn't changed, skip processing (unless force processing is enabled)
+            if (not FORCE_PROCESSING and 
+                file_info['mtime'] == prev_file_info.get('mtime', 0) and 
+                file_info['size'] == prev_file_info.get('size', 0)):
+                logger.info("No changes in ordprod.dbf file")
+                logger.info("=" * 60)
+                logger.info("WAITING FOR NEXT CHECK...")
+                logger.info("=" * 60)
+                return {"status": "completed", "changes_found": False, "records_processed": 0}
+                
+            if FORCE_PROCESSING:
+                logger.info("Force processing enabled - processing all records regardless of changes...")
+                # Reset NO_ORDP tracking to process all records
+                self.state['last_processed_ordp'] = 0
+            else:
+                logger.info("File has been modified - processing new records based on NO_ORDP sequence...")
+            
+            # Open the DBF file
+            logger.info(f"Opening DBF file: {ORDPROD_DBF_PATH}")
+            dbf = DBF(ORDPROD_DBF_PATH, ignore_missing_memofile=True)
+            
+            # Process records based on NO_ORDP sequence (only new records)
+            record_count = 0
+            new_record_count = 0
+            successful_sends = 0
+            total_sent = 0
+            
+            # First, collect all records with NO_ORDP > last_processed_ordp
             all_records = []
-            processed_count = 0
-            new_records_count = 0
+            highest_ordp = self.state.get('last_processed_ordp', 0)
+            
+            logger.info(f"Analyzing records based on NO_ORDP sequence, last processed: {highest_ordp}")
             
             for record in dbf:
                 record_dict = dict(record)
-                no_opro = self.clean_value(record_dict.get('NO_OPRO', ''))
+                no_ordp = self.clean_value(record_dict.get('NO_ORDP', '0'))
                 
-                # Skip records without NO_OPRO
-                if not no_opro:
+                # Skip records without valid NO_ORDP
+                if not no_ordp or not no_ordp.isdigit():
                     continue
                 
-                # Use NO_OPRO sequence to determine which records to process
-                # On first run, process all records with NO_OPRO greater than the starting value
-                # On subsequent runs, only process records with NO_OPRO greater than the last processed
-                if self.is_new_record(no_opro):
-                    new_records_count += 1
-                    mapped_record = self.map_record_to_api(record_dict)
+                # Only process records with NO_ORDP greater than last processed
+                if self.is_new_record(no_ordp):
+                    mapped_record = self.map_ordprod_record_to_inventory_code(record_dict)
                     if mapped_record:
-                        all_records.append(mapped_record)
-                        processed_count += 1
+                        all_records.append((int(no_ordp), mapped_record))
+                        new_record_count += 1
                         
-                        # Log progress every 100 records
-                        if processed_count % 100 == 0:
-                            logger.info(f"Processed {processed_count} records so far...")
-                else:
-                    # Record has already been processed (based on NO_OPRO sequence), skip it
-                    continue
+                        # Track the highest NO_ORDP for state update
+                        current_ordp = int(no_ordp)
+                        if current_ordp > highest_ordp:
+                            highest_ordp = current_ordp
             
-            logger.info(f"Found {new_records_count} new records based on NO_OPRO sequence, prepared {len(all_records)} valid records for sending")
+            logger.info(f"Found {new_record_count} new records based on NO_ORDP sequence")
             
-            # Sort records by NO_OPRO to maintain proper sequence
-            all_records.sort(key=lambda x: int(self.clean_value(x.get('no_opro', '0'))) if self.clean_value(x.get('no_opro', '0')).isdigit() else 0)
-            
-            # Debug information
-            logger.debug(f"New records based on NO_OPRO: {new_records_count}")
-            logger.debug(f"Records to send: {len(all_records)}")
-            logger.debug(f"First run: {self.first_run}")
-            
-            if not all_records:
-                logger.info("No new records to send based on NO_OPRO sequence")
-                # Save state to persist last modified times
-                self.save_state()
-                self.save_last_modified_state()
-                # Reset first_run flag after first execution
-                self.first_run = False
-                return True
-            
-            # Send in batches
-            successful_sends = 0
-            total_records = len(all_records)
-            
-            for i in range(0, len(all_records), BATCH_SIZE):
-                batch = all_records[i:i + BATCH_SIZE]
-                logger.info(f"Processing batch {i//BATCH_SIZE + 1} ({len(batch)} records)")
-                batch_result = self.send_batch_to_api(batch)
-                if batch_result.get("success"):
-                    result_data = batch_result.get("data", {})
-                    success_count = result_data.get('success_count', len(batch))
-                    successful_sends += success_count
-                    logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {success_count} records successful")
-                else:
-                    logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error')}")
-            
-            logger.info(f"Total records sent: {successful_sends}/{total_records}")
-            
-            # Update and save state to track the highest NO_OPRO processed
             if all_records:
-                # Find the highest NO_OPRO in the processed records
-                valid_opros = []
-                for record in all_records:
-                    no_opro = self.clean_value(record.get('no_opro', '0'))
-                    if no_opro.isdigit():
-                        valid_opros.append(int(no_opro))
+                # Sort records by NO_ORDP to maintain proper sequence
+                all_records.sort(key=lambda x: x[0])  # Sort by the NO_ORDP value (first element)
                 
-                if valid_opros:
-                    highest_opro = max(valid_opros)
-                    self.state['last_processed_opro'] = highest_opro
-                    logger.info(f"Updated last processed NO_OPRO to: {highest_opro}")
-                else:
-                    logger.warning("No valid NO_OPRO values found in processed records")
+                # Extract just the mapped records for batch processing
+                batch_records = [record for _, record in all_records]
+                
+                # Process all new records in batches
+                for i in range(0, len(batch_records), BATCH_SIZE):
+                    batch = batch_records[i:i + BATCH_SIZE]
+                    batch_result = self.send_inventory_codes_batch_to_api(batch)
+                    total_sent += len(batch)
+                    
+                    if batch_result.get("success"):
+                        # Calculate success count from the response
+                        result_data = batch_result.get("data", {})
+                        batch_success_count = result_data.get('success_count', len(batch))
+                        successful_sends += batch_success_count
+                        logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {batch_success_count}/{len(batch)} records successful")
+                        
+                        # Log any errors in the batch
+                        for j, res in enumerate(result_data.get('results', [])):
+                            if res.get('status') == 'error':
+                                logger.warning(f"Record {i + j} in batch failed: {res.get('errors', 'Unknown error')}")
+                    else:
+                        logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error', 'Unknown error')}")
+                        
+                        # If batch failed, try sending records individually
+                        for idx, mapped_record in enumerate(batch):
+                            no_ordp = mapped_record.get('no_ordp', 'N/A')
+                            individual_result = self.send_inventory_code_to_api(mapped_record)
+                            
+                            if individual_result.get("success"):
+                                successful_sends += 1
+                                logger.info(f"New record with NO_ORDP {no_ordp} sent successfully (individual send)")
+                            else:
+                                logger.error(f"New record with NO_ORDP {no_ordp} failed: {individual_result.get('error', 'Unknown error')}")
+                        
+                    # Show progress every 50 records
+                    records_processed = min(i + BATCH_SIZE, len(batch_records))
+                    if records_processed % 50 == 0:
+                        elapsed = time.time() - start_time
+                        rate = records_processed / elapsed if elapsed > 0 else 0
+                        logger.info(f"Processed {records_processed}/{new_record_count} new records ({rate:.1f} records/sec)...")
+            else:
+                logger.info("No new records found based on NO_ORDP sequence")
+                
+                # Show progress every 50 records
+                if record_count % 50 == 0:
+                    elapsed = time.time() - start_time
+                    rate = record_count / elapsed if elapsed > 0 else 0
+                    logger.info(f"Processed {record_count} records ({rate:.1f} records/sec)...")
             
-            # Save state to persist last modified times and NO_OPRO tracking
-            self.save_state()
-            self.save_last_modified_state()
-            # Reset first_run flag after first execution
-            self.first_run = False
+            logger.info(f"Overall result: {successful_sends}/{total_sent} records sent successfully")
             
-            return True
+            # Update state to track the highest NO_ORDP processed
+            # Always update the last processed ordp to maintain sequence
+            self.state['last_processed_ordp'] = highest_ordp
+            logger.info(f"Updated last processed NO_ORDP to: {highest_ordp}")
+            
+            # Update file info state
+            self.state['file_info'] = file_info
+            if self.save_state():
+                logger.info("State saved")
+            else:
+                logger.error("Failed to save state")
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f'Processing completed in: {elapsed_time:.2f} seconds')
+            
+            logger.info("=" * 60)
+            logger.info("WAITING FOR NEXT CHECK...")
+            logger.info("=" * 60)
+            
+            return {
+                "status": "completed",
+                "records_processed": record_count,
+                "successful_sends": successful_sends,
+                "total_sent": total_sent,
+                "processing_time": elapsed_time
+            }
             
         except Exception as e:
-            logger.error(f"Error processing DBF file: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Critical error in process_ordprod_file: {e}")
+            logger.error(traceback.format_exc())
+            return {"status": "error", "message": str(e)}
+
+    def run_once(self) -> bool:
+        """Run processing once and return success status"""
+        try:
+            result = self.process_ordprod_file()
+            if result.get("status") == "completed":
+                logger.info(f"Summary: {result.get('records_processed', 0)} records processed")
+                if 'successful_sends' in result:
+                    logger.info(f"Successfully sent: {result.get('successful_sends', 0)}/{result.get('total_sent', 0)} records")
+                return True
+            else:
+                logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
+                return False
+        except Exception as e:
+            logger.error(f"Error in run_once: {e}")
+            logger.error(traceback.format_exc())
             return False
+
+    def run_continuous(self) -> None:
+        """Main loop that runs processing continuously"""
+        logger.info("Starting ORDPROD INVENTORY CODES processing service...")
+        logger.info("Configuration:")
+        logger.info(f"  - API URL: {API_BASE_URL}{INVENTORY_CODES_ENDPOINT}")
+        logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
+        logger.info(f"  - DBF file: {ORDPROD_DBF_PATH}")
+        logger.info(f"  - Processing ALL records (no limit)")
+        logger.info("")
+        
+        while True:
+            try:
+                success = self.run_once()
+                logger.info(f"Sleeping for {CHECK_INTERVAL} seconds...")
+                time.sleep(CHECK_INTERVAL)
+                
+            except KeyboardInterrupt:
+                logger.info("Stopping automatic processing service...")
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                logger.error(traceback.format_exc())
+                logger.info("Continuing...")
+                time.sleep(CHECK_INTERVAL)
 
 def main():
     """Main function"""
-    logger.info("Starting CORRECTED SCHEMA DBF Uploader")
-    
-    # Check if force send flag is set
-    force_send = '--force-send' in sys.argv
-    
-    # Check if clear state flag is set
-    if '--clear-state' in sys.argv:
-        logger.info("Clearing state file...")
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-            logger.info(f"State file {STATE_FILE} cleared")
-        else:
-            logger.info("State file not found")
-        
-        if os.path.exists(LAST_MODIFIED_FILE):
-            os.remove(LAST_MODIFIED_FILE)
-            logger.info(f"Last modified file {LAST_MODIFIED_FILE} cleared")
-        else:
-            logger.info("Last modified file not found")
-    
-    # Check if clear state for specific environment flag is set
-    if '--clear-local-state' in sys.argv and not getattr(sys, 'frozen', False):
-        logger.info("Clearing local state files...")
-        local_state_files = [
-            "dbf_state_corrected_unix.json",
-            "dbf_state_corrected.json"
-        ]
-        for state_file in local_state_files:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), state_file)
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info(f"Local state file {state_file} cleared")
-        
-        local_modified_files = [
-            "last_modified_state_unix.json",
-            "last_modified_state.json"
-        ]
-        for mod_file in local_modified_files:
-            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), mod_file)
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info(f"Local last modified file {mod_file} cleared")
-    
-    if '--clear-server-state' in sys.argv and getattr(sys, 'frozen', False):
-        logger.info("Clearing server state files...")
-        server_state_files = [
-            "dbf_state_corrected_windows.json",
-            "dbf_state_corrected.json"
-        ]
-        for state_file in server_state_files:
-            full_path = os.path.join(sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__)), state_file)
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info(f"Server state file {state_file} cleared")
-        
-        server_modified_files = [
-            "last_modified_state_windows.json",
-            "last_modified_state.json"
-        ]
-        for mod_file in server_modified_files:
-            full_path = os.path.join(sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__)), mod_file)
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info(f"Server last modified file {mod_file} cleared")
-    
-    uploader = CorrectedSchemaUploader()
-    
-    # Run in continuous mode
-    while True:
-        try:
-            logger.info("Checking for DBF file updates...")
-            if force_send:
-                logger.info("Force send mode enabled - sending all records")
-                # Temporarily reset NO_OPRO tracking to force sending all records
-                uploader.state['last_processed_opro'] = 0  # Reset to process all records
-            
-            success = uploader.process_dbf_file()
-            
-            if success:
-                logger.info("Upload cycle completed successfully!")
-            else:
-                logger.error("Upload cycle failed!")
-                
-            # Wait before next check (30 seconds)
-            logger.info("Waiting 30 seconds before next check...")
-            time.sleep(30)
-            
-        except KeyboardInterrupt:
-            logger.info("Upload process interrupted by user")
-            # Save state before exiting
-            uploader.save_state()
-            uploader.save_last_modified_state()
-            break
-        except Exception as e:
-            logger.error(f"Error in upload cycle: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            # Wait before retrying after error
-            time.sleep(30)
+    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        uploader = OrdProdInventoryUploader()
+        success = uploader.run_once()
+        sys.exit(0 if success else 1)
+    else:
+        uploader = OrdProdInventoryUploader()
+        uploader.run_continuous()
 
 if __name__ == '__main__':
     main()
