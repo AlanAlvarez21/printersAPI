@@ -9,6 +9,17 @@ import hashlib
 import sys
 from typing import Dict, List, Optional, Any
 import traceback
+import certifi
+
+# Fix SSL para PyInstaller
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+# Si estamos en un ejecutable de PyInstaller
+if getattr(sys, 'frozen', False):
+    import ssl
+    # Crear contexto SSL apropiado
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 # Configure logging
 logging.basicConfig(

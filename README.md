@@ -30,6 +30,38 @@ Clone this repo and run the following commands from the project root:
 2. `npm start`
 3. Visit http://localhost:3000 to see your app running
 
+## Printer & Scale GUI Application
+
+This repository also includes a Python GUI application for controlling printers and scales:
+
+### Features
+- Printer control for TSC TX200 devices via USB
+- Scale integration for serial weight measurements
+- Real-time data display
+- Label printing capabilities
+
+### Installation
+1. Create a virtual environment:
+   ```bash
+   python3 -m venv venv
+   ```
+2. Activate the virtual environment:
+   ```bash
+   source venv/bin/activate
+   ```
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+### Usage
+Run the GUI application:
+```bash
+python3 gui_demo.py
+```
+
+See [README_GUI.md](README_GUI.md) for detailed documentation.
+
 ## Deploying to FL0
 
 Checkout our [Getting Started Guide](https://docs.fl0.com) in the FL0 documentation!

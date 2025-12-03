@@ -1,0 +1,6 @@
+pyserial
+pyusb
+requests
+flask
+flask-cors
+dbfread

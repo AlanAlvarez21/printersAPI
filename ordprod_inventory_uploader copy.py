@@ -45,9 +45,6 @@ class OrdProdInventoryUploader:
     def __init__(self):
         self.state = self.load_state()
         self.session = requests.Session()
-        # Initialize with a default starting NO_ORDP if not set
-        if 'last_processed_ordp' not in self.state:
-            self.state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
         
     def load_state(self) -> Dict:
         """Load the last processed state from file"""
@@ -56,14 +53,10 @@ class OrdProdInventoryUploader:
                 with open(STATE_FILE, 'r', encoding='utf-8') as f:
                     state = json.load(f)
                     logger.info(f"Loaded state with {len(state)} entries")
-                    # Set default last_processed_ordp if not present
-                    if 'last_processed_ordp' not in state:
-                        state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
                     return state
         except Exception as e:
             logger.warning(f"Could not load state file: {e}")
-        # Default state with starting NO_ORDP
-        return {'last_processed_ordp': 0}
+        return {}
 
     def save_state(self) -> bool:
         """Save the current state to file"""
@@ -74,16 +67,6 @@ class OrdProdInventoryUploader:
             return True
         except Exception as e:
             logger.error(f"Error saving state: {e}")
-            return False
-
-    def is_new_record(self, no_ordp: str) -> bool:
-        """Check if this is a new record based on NO_ORDP sequence"""
-        try:
-            current_ordp = int(no_ordp)
-            last_processed = self.state.get('last_processed_ordp', 0)
-            return current_ordp > last_processed
-        except ValueError:
-            logger.warning(f"Invalid NO_ORDP value: {no_ordp}")
             return False
 
     def get_file_hash(self, filepath: str) -> Optional[Dict]:
@@ -208,86 +191,6 @@ class OrdProdInventoryUploader:
         logger.error("Failed to send inventory code after all retries")
         return {"success": False, "error": "Failed after retries"}
 
-    def send_inventory_codes_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of inventory codes to the API endpoint - fallback to individual sends if no batch endpoint exists"""
-        # First try the batch endpoint if it exists
-        for attempt in range(MAX_RETRIES):
-            try:
-                logger.info(f"Sending batch of {len(batch_data)} inventory codes to API")
-                
-                # Create a payload with the batch of inventory codes
-                payload = {
-                    "inventory_codes": batch_data
-                }
-                
-                logger.debug(f"Batch payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}...")
-                
-                response = self.session.post(
-                    API_BASE_URL + INVENTORY_CODES_ENDPOINT + "/batch",  # Try batch endpoint first
-                    json=payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=API_TIMEOUT * 2  # Increase timeout for batch processing
-                )
-                
-                logger.info(f"API Response Status: {response.status_code}")
-                
-                if response.status_code in [200, 201]:
-                    try:
-                        result = response.json()
-                        success_count = result.get('success_count', len(batch_data))
-                        total_count = result.get('total_count', len(batch_data))
-                        logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                        return {"success": True, "data": result}
-                    except Exception as json_error:
-                        logger.error(f"Error parsing JSON response: {json_error}")
-                        logger.error(f"Response text: {response.text[:500]}...")
-                        return {"success": True, "data": {"message": "Success but parsing error"}}
-                elif response.status_code == 404:
-                    logger.info("Batch endpoint not found, falling back to individual sends")
-                    break  # Break to fallback to individual sends
-                else:
-                    logger.warning(f"API batch returned {response.status_code}: {response.text}")
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 ** attempt)
-                        continue
-                        
-            except requests.exceptions.Timeout:
-                logger.warning(f"Batch timeout on attempt {attempt + 1}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Batch request error on attempt {attempt + 1}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except Exception as e:
-                logger.error(f"Unexpected batch error on attempt {attempt + 1}: {e}")
-                logger.error(traceback.format_exc())
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-        
-        # If batch endpoint doesn't exist or failed, fall back to sending individually
-        logger.info("Falling back to individual sends for batch...")
-        successful_sends = 0
-        results = []
-        
-        for inventory_code_data in batch_data:
-            result = self.send_inventory_code_to_api(inventory_code_data)
-            if result.get("success"):
-                successful_sends += 1
-            results.append(result)
-        
-        return {
-            "success": True,
-            "data": {
-                "success_count": successful_sends,
-                "total_count": len(batch_data),
-                "results": results
-            }
-        }
-
     def process_ordprod_file(self) -> Dict:
         """Process ordprod.dbf file and send records as inventory codes to API"""
         try:
@@ -323,96 +226,41 @@ class OrdProdInventoryUploader:
                 return {"status": "completed", "changes_found": False, "records_processed": 0}
                 
             if FORCE_PROCESSING:
-                logger.info("Force processing enabled - processing all records regardless of changes...")
-                # Reset NO_ORDP tracking to process all records
-                self.state['last_processed_ordp'] = 0
+                logger.info("Force processing enabled - processing file regardless of changes...")
             else:
-                logger.info("File has been modified - processing new records based on NO_ORDP sequence...")
+                logger.info("File has been modified - processing...")
             
             # Open the DBF file
             logger.info(f"Opening DBF file: {ORDPROD_DBF_PATH}")
             dbf = DBF(ORDPROD_DBF_PATH, ignore_missing_memofile=True)
             
-            # Process records based on NO_ORDP sequence (only new records)
+            # Process ALL records (no artificial limit)
             record_count = 0
-            new_record_count = 0
             successful_sends = 0
             total_sent = 0
             
-            # First, collect all records with NO_ORDP > last_processed_ordp
-            all_records = []
-            highest_ordp = self.state.get('last_processed_ordp', 0)
-            
-            logger.info(f"Analyzing records based on NO_ORDP sequence, last processed: {highest_ordp}")
+            logger.info(f"Processing ALL records from {ORDPROD_DBF_PATH}...")
+            logger.info(f"Total records in file: {len(dbf)}")
             
             for record in dbf:
+                record_count += 1
+                
                 record_dict = dict(record)
-                no_ordp = self.clean_value(record_dict.get('NO_ORDP', '0'))
                 
-                # Skip records without valid NO_ORDP
-                if not no_ordp or not no_ordp.isdigit():
-                    continue
-                
-                # Only process records with NO_ORDP greater than last processed
-                if self.is_new_record(no_ordp):
-                    mapped_record = self.map_ordprod_record_to_inventory_code(record_dict)
-                    if mapped_record:
-                        all_records.append((int(no_ordp), mapped_record))
-                        new_record_count += 1
-                        
-                        # Track the highest NO_ORDP for state update
-                        current_ordp = int(no_ordp)
-                        if current_ordp > highest_ordp:
-                            highest_ordp = current_ordp
-            
-            logger.info(f"Found {new_record_count} new records based on NO_ORDP sequence")
-            
-            if all_records:
-                # Sort records by NO_ORDP to maintain proper sequence
-                all_records.sort(key=lambda x: x[0])  # Sort by the NO_ORDP value (first element)
-                
-                # Extract just the mapped records for batch processing
-                batch_records = [record for _, record in all_records]
-                
-                # Process all new records in batches
-                for i in range(0, len(batch_records), BATCH_SIZE):
-                    batch = batch_records[i:i + BATCH_SIZE]
-                    batch_result = self.send_inventory_codes_batch_to_api(batch)
-                    total_sent += len(batch)
+                # Map record to inventory code format
+                mapped_record = self.map_ordprod_record_to_inventory_code(record_dict)
+                if mapped_record:
+                    # Send each record individually
+                    result = self.send_inventory_code_to_api(mapped_record)
+                    total_sent += 1
                     
-                    if batch_result.get("success"):
-                        # Calculate success count from the response
-                        result_data = batch_result.get("data", {})
-                        batch_success_count = result_data.get('success_count', len(batch))
-                        successful_sends += batch_success_count
-                        logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {batch_success_count}/{len(batch)} records successful")
-                        
-                        # Log any errors in the batch
-                        for j, res in enumerate(result_data.get('results', [])):
-                            if res.get('status') == 'error':
-                                logger.warning(f"Record {i + j} in batch failed: {res.get('errors', 'Unknown error')}")
+                    if result.get("success"):
+                        successful_sends += 1
+                        logger.info(f"Record {record_count} sent successfully")
                     else:
-                        logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error', 'Unknown error')}")
-                        
-                        # If batch failed, try sending records individually
-                        for idx, mapped_record in enumerate(batch):
-                            no_ordp = mapped_record.get('no_ordp', 'N/A')
-                            individual_result = self.send_inventory_code_to_api(mapped_record)
-                            
-                            if individual_result.get("success"):
-                                successful_sends += 1
-                                logger.info(f"New record with NO_ORDP {no_ordp} sent successfully (individual send)")
-                            else:
-                                logger.error(f"New record with NO_ORDP {no_ordp} failed: {individual_result.get('error', 'Unknown error')}")
-                        
-                    # Show progress every 50 records
-                    records_processed = min(i + BATCH_SIZE, len(batch_records))
-                    if records_processed % 50 == 0:
-                        elapsed = time.time() - start_time
-                        rate = records_processed / elapsed if elapsed > 0 else 0
-                        logger.info(f"Processed {records_processed}/{new_record_count} new records ({rate:.1f} records/sec)...")
-            else:
-                logger.info("No new records found based on NO_ORDP sequence")
+                        logger.error(f"Record {record_count} failed: {result.get('error', 'Unknown error')}")
+                else:
+                    logger.warning(f"Record {record_count} could not be mapped")
                 
                 # Show progress every 50 records
                 if record_count % 50 == 0:
@@ -422,12 +270,7 @@ class OrdProdInventoryUploader:
             
             logger.info(f"Overall result: {successful_sends}/{total_sent} records sent successfully")
             
-            # Update state to track the highest NO_ORDP processed
-            # Always update the last processed ordp to maintain sequence
-            self.state['last_processed_ordp'] = highest_ordp
-            logger.info(f"Updated last processed NO_ORDP to: {highest_ordp}")
-            
-            # Update file info state
+            # Update state
             self.state['file_info'] = file_info
             if self.save_state():
                 logger.info("State saved")

@@ -1,0 +1,6 @@
+{
+  "scale_port": "/dev/cu.usbmodem12401",
+  "label_content": "TEST LABEL",
+  "scale_connected": false,
+  "printer_connected": false
+}
