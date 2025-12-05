@@ -29,6 +29,7 @@ logger = logging.getLogger('CorrectedSchemaUploader')
 API_BASE_URL = "https://wmsys.fly.dev"  # Production URL
 # API_BASE_URL = "http://localhost:3000"  # Local development URL
 API_ENDPOINT = "/api/production_orders/batch"
+API_LAST_OPRO_ENDPOINT = "/api/production_orders/last_no_opro"
 API_TIMEOUT = 90
 MAX_RETRIES = 3
 
@@ -59,9 +60,40 @@ class CorrectedSchemaUploader:
         self.last_modified_state = self.load_last_modified_state()
         # Check if this is the first run
         self.first_run = not os.path.exists(STATE_FILE) and not os.path.exists(LAST_MODIFIED_FILE)
-        # Initialize with a default starting NO_OPRO if not set, based on user requirement starting at 936
-        if 'last_processed_opro' not in self.state:
-            self.state['last_processed_opro'] = 936  # Starting from the specified value
+        # Get last processed NO_OPRO from API (source of truth)
+        self.sync_last_opro_from_api()
+    
+    def get_last_opro_from_api(self) -> int:
+        """Get the last NO_OPRO from wmsys API"""
+        try:
+            logger.info("Fetching last NO_OPRO from API...")
+            response = self.session.get(
+                API_BASE_URL + API_LAST_OPRO_ENDPOINT,
+                timeout=30
+            )
+            if response.status_code == 200:
+                data = response.json()
+                last_opro = data.get('last_no_opro', 0)
+                logger.info(f"API returned last NO_OPRO: {last_opro}")
+                return int(last_opro) if last_opro else 0
+            else:
+                logger.warning(f"API returned status {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Could not fetch last NO_OPRO from API: {e}")
+        return 0
+    
+    def sync_last_opro_from_api(self):
+        """Sync the last processed NO_OPRO from API"""
+        api_last_opro = self.get_last_opro_from_api()
+        local_last_opro = self.state.get('last_processed_opro', 0)
+        
+        # Use the higher value between API and local state
+        if api_last_opro > local_last_opro:
+            logger.info(f"Syncing from API: {local_last_opro} -> {api_last_opro}")
+            self.state['last_processed_opro'] = api_last_opro
+            self.save_state()
+        elif local_last_opro > api_last_opro:
+            logger.info(f"Local state is ahead: {local_last_opro} > API: {api_last_opro}")
         
     def load_state(self) -> Dict:
         """Load the last processed state from file"""
@@ -69,14 +101,12 @@ class CorrectedSchemaUploader:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, 'r', encoding='utf-8') as f:
                     state = json.load(f)
-                    # Set default last_processed_opro if not present
                     if 'last_processed_opro' not in state:
-                        state['last_processed_opro'] = 936  # Starting from the specified value
+                        state['last_processed_opro'] = 0
                     return state
         except Exception as e:
             logger.warning(f"Could not load state file: {e}")
-        # Default state with starting NO_OPRO
-        return {'last_processed_opro': 936}
+        return {'last_processed_opro': 0}
 
     def save_state(self) -> bool:
         """Save the current state to file"""
@@ -132,7 +162,7 @@ class CorrectedSchemaUploader:
         """Check if this is a new record based on NO_OPRO sequence"""
         try:
             current_opro = int(no_opro)
-            last_processed = self.state.get('last_processed_opro', 936)
+            last_processed = self.state.get('last_processed_opro', 0)
             return current_opro > last_processed
         except ValueError:
             logger.warning(f"Invalid NO_OPRO value: {no_opro}")
