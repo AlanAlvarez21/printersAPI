@@ -355,23 +355,42 @@ class CorrectedSchemaUploader:
                     logger.debug(f"API Response Content: {json.dumps(response_content, indent=2)}")
                 except:
                     logger.debug(f"API Response Text: {response.text}")
+                    response_content = {}
                 
                 if response.status_code == 200:
                     try:
-                        result = response.json()
+                        result = response_content
                         success_count = result.get('success_count', 0)
                         total_count = result.get('total_count', len(batch_data))
                         logger.info(f"API processed batch: {success_count}/{total_count} records successful")
                         
-                        # Log individual results
+                        existing_opros = []
+                        
+                        # Log individual results and check for "already in use" errors
                         for i, res in enumerate(result.get('results', [])):
                             if res.get('status') == 'error':
-                                logger.warning(f"Record {i} failed: {res.get('errors', 'Unknown error')}")
+                                errors = res.get('errors', [])
+                                logger.warning(f"Record {i} failed: {errors}")
+                                
+                                # Check for "already in use" error
+                                # Error format might varies, checking string presence
+                                error_str = str(errors).lower()
+                                if "ya está en uso" in error_str or "already in use" in error_str:
+                                    # Try to get the NO_OPRO from the batch data at this index
+                                    if i < len(batch_data):
+                                        record = batch_data[i]
+                                        opro = record.get('no_opro')
+                                        if opro:
+                                            existing_opros.append(opro)
                         
-                        return {"success": True, "data": result}
+                        return {
+                            "success": True, 
+                            "data": result,
+                            "existing_opros": existing_opros
+                        }
                     except Exception as e:
                         logger.info(f"Batch sent successfully but error parsing response: {e}")
-                        return {"success": True, "data": {}}
+                        return {"success": True, "data": {}, "existing_opros": []}
                 else:
                     logger.warning(f"API error {response.status_code}: {response.text}")
                     if attempt < MAX_RETRIES - 1:
@@ -382,7 +401,7 @@ class CorrectedSchemaUploader:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     
-        return {"success": False, "error": "Failed after retries"}
+        return {"success": False, "error": "Failed after retries", "existing_opros": []}
 
     def process_dbf_file(self) -> bool:
         """Process DBF file with CORRECT schema mapping"""
@@ -420,6 +439,10 @@ class CorrectedSchemaUploader:
             processed_count = 0
             new_records_count = 0
             
+            # Get the initial last processed OPRO
+            current_last_opro = self.state.get('last_processed_opro', 0)
+            logger.info(f"Starting process with known last NO_OPRO: {current_last_opro}")
+            
             for record in dbf:
                 record_dict = dict(record)
                 no_opro = self.clean_value(record_dict.get('NO_OPRO', ''))
@@ -429,20 +452,20 @@ class CorrectedSchemaUploader:
                     continue
                 
                 # Use NO_OPRO sequence to determine which records to process
-                # On first run, process all records with NO_OPRO greater than the starting value
-                # On subsequent runs, only process records with NO_OPRO greater than the last processed
-                if self.is_new_record(no_opro):
-                    new_records_count += 1
-                    mapped_record = self.map_record_to_api(record_dict)
-                    if mapped_record:
-                        all_records.append(mapped_record)
-                        processed_count += 1
-                        
-                        # Log progress every 100 records
-                        if processed_count % 100 == 0:
-                            logger.info(f"Processed {processed_count} records so far...")
-                else:
-                    # Record has already been processed (based on NO_OPRO sequence), skip it
+                # We check directly against the known state
+                try:
+                    current_opro_val = int(no_opro)
+                    if current_opro_val > current_last_opro:
+                        new_records_count += 1
+                        mapped_record = self.map_record_to_api(record_dict)
+                        if mapped_record:
+                            all_records.append(mapped_record)
+                            processed_count += 1
+                            
+                            # Log progress every 100 records
+                            if processed_count % 100 == 0:
+                                logger.info(f"Processed {processed_count} records so far...")
+                except ValueError:
                     continue
             
             logger.info(f"Found {new_records_count} new records based on NO_OPRO sequence, prepared {len(all_records)} valid records for sending")
@@ -468,23 +491,72 @@ class CorrectedSchemaUploader:
             successful_sends = 0
             total_records = len(all_records)
             
+            # Track dynamic last processed OPRO during batch sending
+            # This allows us to skip batches if we detect they are already in DB
+            dynamic_last_opro = current_last_opro
+            
             for i in range(0, len(all_records), BATCH_SIZE):
                 batch = all_records[i:i + BATCH_SIZE]
-                logger.info(f"Processing batch {i//BATCH_SIZE + 1} ({len(batch)} records)")
+                
+                # Skip this batch if all records in it are already covered by dynamic_last_opro
+                # We check the LAST record in the batch (since they are sorted)
+                try:
+                    last_record_in_batch_opro = int(batch[-1]['no_opro'])
+                    first_record_in_batch_opro = int(batch[0]['no_opro'])
+                    
+                    if last_record_in_batch_opro <= dynamic_last_opro:
+                        logger.info(f"Skipping batch {i//BATCH_SIZE + 1} (OPROs {first_record_in_batch_opro}-{last_record_in_batch_opro}) - already processed/exists")
+                        continue
+                        
+                    # If partially processed (rare due to batching), filter out already processed ones
+                    if first_record_in_batch_opro <= dynamic_last_opro:
+                        logger.info(f"Filtering batch {i//BATCH_SIZE + 1} - some records already processed")
+                        batch = [r for r in batch if int(r['no_opro']) > dynamic_last_opro]
+                        if not batch:
+                            continue
+                except (ValueError, IndexError):
+                    pass
+                
+                logger.info(f"Processing batch {i//BATCH_SIZE + 1} ({len(batch)} records, OPROs {batch[0].get('no_opro')} - {batch[-1].get('no_opro')})")
+                
                 batch_result = self.send_batch_to_api(batch)
+                
                 if batch_result.get("success"):
                     result_data = batch_result.get("data", {})
                     success_count = result_data.get('success_count', len(batch))
                     successful_sends += success_count
                     logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {success_count} records successful")
+                    
+                    # Check for "existing_opros" to fast-forward state
+                    existing_opros = batch_result.get("existing_opros", [])
+                    if existing_opros:
+                        logger.info(f"Detected {len(existing_opros)} existing records in this batch.")
+                        try:
+                            # Convert to ints to find max
+                            existing_ints = [int(o) for o in existing_opros if str(o).isdigit()]
+                            if existing_ints:
+                                max_existing = max(existing_ints)
+                                if max_existing > dynamic_last_opro:
+                                    logger.info(f"Fast-forwarding state: {dynamic_last_opro} -> {max_existing}")
+                                    dynamic_last_opro = max_existing
+                                    
+                                    # Update persistent state immediately to avoid reprocessing on restart
+                                    if max_existing > self.state.get('last_processed_opro', 0):
+                                        self.state['last_processed_opro'] = max_existing
+                                        self.save_state()
+                        except ValueError:
+                            pass
                 else:
                     logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error')}")
             
             logger.info(f"Total records sent: {successful_sends}/{total_records}")
             
             # Update and save state to track the highest NO_OPRO processed
+            # We use dynamic_last_opro which might have been updated from "existing" errors
+            # Or from successfully processed records
+            
+            # Also check the actually processed records to ensure we cover successful sends
             if all_records:
-                # Find the highest NO_OPRO in the processed records
                 valid_opros = []
                 for record in all_records:
                     no_opro = self.clean_value(record.get('no_opro', '0'))
@@ -492,11 +564,14 @@ class CorrectedSchemaUploader:
                         valid_opros.append(int(no_opro))
                 
                 if valid_opros:
-                    highest_opro = max(valid_opros)
-                    self.state['last_processed_opro'] = highest_opro
-                    logger.info(f"Updated last processed NO_OPRO to: {highest_opro}")
-                else:
-                    logger.warning("No valid NO_OPRO values found in processed records")
+                    max_in_batch = max(valid_opros)
+                    if max_in_batch > dynamic_last_opro:
+                        dynamic_last_opro = max_in_batch
+            
+            # Final state update
+            if dynamic_last_opro > self.state.get('last_processed_opro', 0):
+                self.state['last_processed_opro'] = dynamic_last_opro
+                logger.info(f"Updated last processed NO_OPRO to: {dynamic_last_opro}")
             
             # Save state to persist last modified times and NO_OPRO tracking
             self.save_state()
