@@ -4,7 +4,11 @@
   "description": "A simple Node.js Express app for getting started on FL0",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node app.js"
+    "start": "node app.js",
+    "tunnel": "NODE_ENV=development node app.js",
+    "dev": "NODE_ENV=development node app.js",
+    "build": "pkg . --targets node18-win-x64,node18-linux-x64,node18-macos-x64 --output dist/printer-tunnel",
+    "build-win": "pkg . --targets node18-win-x64 --output dist/printer-tunnel.exe"
   },
   "author": "",
   "license": "ISC",
@@ -12,9 +16,22 @@
     "axios": "^1.6.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "open": "^11.0.0"
   },
   "devDependencies": {
-    "@flydotio/dockerfile": "^0.4.11"
+    "@flydotio/dockerfile": "^0.4.11",
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [
+      "tunnel.js"
+    ],
+    "targets": [
+      "node18-win-x64",
+      "node18-linux-x64",
+      "node18-macos-x64"
+    ],
+    "outputPath": "dist"
   }
 }

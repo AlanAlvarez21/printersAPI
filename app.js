@@ -4,6 +4,7 @@ const app = express();
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
+const { startNgrok } = require('./tunnel');
 
 app.use(cors());
 app.use(express.json());
@@ -75,8 +76,17 @@ app.post('/print', async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
+const server = app.listen(3000, async () => {
   console.log(`Servidor en ejecución en el puerto 3000`);
+
+  // Start ngrok tunnel in development environment
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      await startNgrok(3000);
+    } catch (error) {
+      console.error('Failed to start ngrok tunnel:', error);
+    }
+  }
 });
 
 module.exports = app;

@@ -1,79 +1,59 @@
-<p align="center">
-  <a href="https://fl0.com/" target="blank">
-    <img src="https://user-images.githubusercontent.com/88681427/217122968-e6132cad-1944-4ebe-9ec1-105af6a18c4f.png">
-  </a>
-</p>
+# Printer API with Ngrok Tunnel
 
-<h2 align="center">Node.js Quickstart</h2>
-<p align="center">Backend engineering, supercharged.</p>
+This application provides a printing service that can be exposed publicly using ngrok.
 
-## Overview
+## Features
 
-Use this repository to get up and running on FL0 with the following stack:
+- Zebra printer API integration
+- Automatic ngrok tunnel creation when running locally
+- Automatic redirect to https://wmsys.fly.dev
+- Cross-platform tunnel access
 
-<table>
-<tr>
-  <th>Language</th>
-  <td>Javascript</td>
-</tr>
-<tr>
-  <th>Router</th>
-  <td>Express</td>
-</tr>
-</table>
+## Prerequisites
 
-## Getting Started
-
-Clone this repo and run the following commands from the project root:
-
-1. `npm install`
-2. `npm start`
-3. Visit http://localhost:3000 to see your app running
-
-## Printer & Scale GUI Application
-
-This repository also includes a Python GUI application for controlling printers and scales:
-
-### Features
-- Printer control for TSC TX200 devices via USB
-- Scale integration for serial weight measurements
-- Real-time data display
-- Label printing capabilities
-
-### Installation
-1. Create a virtual environment:
+1. **Ngrok Account**: You need an ngrok account (free or paid)
+2. **Ngrok Authentication**: Authenticate your ngrok client:
    ```bash
-   python3 -m venv venv
+   ngrok config add-authtoken YOUR_AUTH_TOKEN
    ```
-2. Activate the virtual environment:
-   ```bash
-   source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+3. **Ngrok Installation**: Install ngrok from https://ngrok.com/download
 
-### Usage
-Run the GUI application:
+## Installation
+
 ```bash
-python3 gui_demo.py
+npm install
 ```
 
-See [README_GUI.md](README_GUI.md) for detailed documentation.
+## Usage
 
-## Deploying to FL0
+### Running with Tunnel (Development)
 
-Checkout our [Getting Started Guide](https://docs.fl0.com) in the FL0 documentation!
+```bash
+npm run tunnel
+```
 
-## Questions
+This will:
+1. Start the Express server on port 3000
+2. Create an ngrok tunnel to your local server
+3. Display the public URL
+4. Automatically redirect to https://wmsys.fly.dev
 
-If you have any questions about FL0 or this template codebase please head on over to our [Discord channel](https://discord.gg/AmmVTt9Jrw).
+### Running Normally
 
-## Issues
+```bash
+npm start
+```
 
-Any issues or feature requests can be raised on the [Issues page](https://github.com/fl0zone/template-nodejs/issues) of this repo.
+## Ngrok Free Tier Limitations
 
-## License
+Note that if you're using the free tier of ngrok:
+- You can only have one tunnel session active at a time
+- If you get an authentication error, make sure no other ngrok processes are running
 
-This template repository is [MIT licensed](LICENSE).
+## API Endpoint
+
+- POST `/print` - Send ZPL code to Zebra printer
+
+## Configuration
+
+The application uses a specific ngrok domain: `pregeological-nonidentical-ines.ngrok-free.app`
