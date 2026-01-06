@@ -1,49 +1,922 @@
-import winreg
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Servidor Flask para comunicación serial con báscula e impresora
+Integra el script de báscula existente con endpoints REST
+"""
+
+import argparse
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+import threading
+import time
+import json
+import serial
 import serial.tools.list_ports
+import usb.core
+import usb.util
+from datetime import datetime
+import csv
+import os
+import sys
+import logging
+import queue
+import subprocess
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import webbrowser
+import atexit
 
-def get_windows_com_ports():
-    """Obtiene puertos COM usando métodos específicos de Windows"""
-    ports = []
-    
-    # Método 1: Usar serial.tools.list_ports (ya lo estamos usando)
-    print("Método 1 - serial.tools.list_ports:")
-    for port in serial.tools.list_ports.comports():
-        print(f"  {port.device}: {port.description} (VID: {port.vid}, PID: {port.pid})")
-        ports.append(port.device)
-    
-    # Método 2: Buscar en el registro de Windows
-    print("\nMétodo 2 - Registro de Windows:")
-    try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
-        i = 0
-        while True:
-            try:
-                name, value, _ = winreg.EnumValue(key, i)
-                print(f"  {name}: {value}")
-                if value not in ports:
-                    ports.append(value)
-                i += 1
-            except WindowsError:
-                break
-        winreg.CloseKey(key)
-    except Exception as e:
-        print(f"  Error accediendo al registro: {e}")
-    
-    return ports
+# Configurar logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-if __name__ == "__main__":
-    print("Verificación de puertos COM en Windows")
-    print("="*50)
-    ports = get_windows_com_ports()
-    print(f"\nPuertos encontrados: {ports}")
-    
-    # Verificar si podemos abrir cada puerto
-    print("\nIntentando abrir cada puerto...")
-    for port in ports:
+# Configurar Flask con el directorio de plantillas
+template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+app = Flask(__name__, template_folder=template_dir)
+CORS(app)
+
+# Variables globales
+scale_data_queue = queue.Queue()
+server_connected = False
+connection_lock = threading.Lock()
+scale_thread = None
+scale_running = False
+
+@dataclass
+class ScaleReading:
+    weight: str
+    timestamp: str
+    status: str = "success"
+
+@dataclass
+class PrintJob:
+    content: str
+    timestamp: str
+    status: str = "pending"
+
+class ScaleManager:
+    def __init__(self, port='COM3', baudrate=115200, parity='N', stopbits=1, bytesize=8):
+        self.port = port
+        self.baudrate = baudrate
+        self.parity = parity
+        self.stopbits = stopbits
+        self.bytesize = bytesize
+        self.serial_connection = None
+        self.is_running = False
+        self.last_reading = None
+        
+    def connect(self) -> bool:
+        """Conecta a la báscula"""
         try:
-            import serial
-            s = serial.Serial(port, baudrate=9600, timeout=1)
-            print(f"  ✓ {port} - ABIERTO EXITOSAMENTE")
-            s.close()
+            # Mostrar puertos disponibles
+            available_ports = serial.tools.list_ports.comports()
+            logger.info("Puertos seriales disponibles:")
+            for port in available_ports:
+                logger.info(f"  - {port.device}")
+            
+            self.serial_connection = serial.Serial(
+                self.port, 
+                baudrate=self.baudrate, 
+                timeout=1, 
+                parity=self.parity, 
+                stopbits=self.stopbits, 
+                bytesize=self.bytesize
+            )
+            logger.info(f"✓ Conexión establecida en el puerto {self.port}")
+            return True
+            
+        except serial.SerialException as e:
+            logger.error(f"✗ Error de conexión serial: {str(e)}")
+            return False
+    
+    def disconnect(self):
+        """Desconecta la báscula"""
+        if self.serial_connection and self.serial_connection.is_open:
+            self.serial_connection.close()
+            logger.info("✓ Puerto serial cerrado correctamente")
+    
+    def read_weight(self, timeout=5) -> Optional[ScaleReading]:
+        """Lee un peso de la báscula, con un timeout"""
+        if not self.serial_connection or not self.serial_connection.is_open:
+            logger.error("La conexión serial no está abierta.")
+            return None
+            
+        try:
+            logger.info("Esperando datos de la báscula...")
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if self.serial_connection.in_waiting > 0:
+                    data = self.serial_connection.readline().decode('utf-8', errors='ignore').strip()
+                    logger.info(f"Datos recibidos: '{data}'")
+
+                    if data:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        reading = ScaleReading(weight=data, timestamp=timestamp)
+                        self.last_reading = reading
+                        
+                        # Escribir a CSV
+                        self._save_to_csv(reading)
+                        
+                        # Print to console immediately when data is received
+                        print(f"\033[92m[{timestamp}]\033[0m Peso: \033[93m{data}\033[0m")
+                        
+                        return reading
+                time.sleep(0.1)
+            
+            logger.warning("No se recibieron datos en el tiempo esperado.")
+            
         except Exception as e:
-            print(f"  ✗ {port} - ERROR: {e}")
+            logger.error(f"Error leyendo báscula: {str(e)}")
+            
+        return None
+    
+    def _save_to_csv(self, reading: ScaleReading):
+        """Guarda lectura en archivo CSV"""
+        try:
+            csv_file = './peso.csv'
+            with open(csv_file, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([reading.timestamp, reading.weight])
+        except Exception as e:
+            logger.error(f"Error guardando CSV: {str(e)}")
+    
+    def start_continuous_reading(self):
+        """Inicia lectura continua en hilo separado"""
+        self.is_running = True
+        
+        def read_loop():
+            while self.is_running:
+                reading = self.read_weight()
+                if reading:
+                    scale_data_queue.put(reading)
+                    # Print to console with colored output
+                    print(f"\033[92m[{reading.timestamp}]\033[0m Peso: \033[93m{reading.weight}\033[0m")
+                time.sleep(0.1)
+        
+        thread = threading.Thread(target=read_loop, daemon=True)
+        thread.start()
+        logger.info("✓ Lectura continua iniciada")
+        
+    def stop_continuous_reading(self):
+        """Detiene lectura continua"""
+        self.is_running = False
+        logger.info("✓ Lectura continua detenida")
+
+class PrinterManager:
+    def __init__(self):
+        self.device = None
+        self.endpoint_out = None
+        self.endpoint_in = None
+        self.serial_connection = None  # Para conexión serial en Windows
+        self.is_usb_connection = False  # Para rastrear el tipo de conexión
+
+    def connect_usb_printer(self) -> bool:
+        """Conecta con impresora TSC TX200 via USB usando tu código"""
+        try:
+            logger.info("Buscando impresora TSC TX200 via USB...")
+
+            # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+            self.device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+
+            if self.device is None:
+                logger.warning("✗ Impresora TSC TX200 no encontrada via USB")
+                logger.info("  Buscando como puerto serial en Windows...")
+                return self._connect_serial_printer()
+
+            logger.info(f"✓ Impresora encontrada via USB: {self.device}")
+            self.is_usb_connection = True
+
+            try:
+                # Configurar dispositivo como en tu código
+                if self.device.is_kernel_driver_active(0):
+                    logger.info("Desconectando driver del kernel...")
+                    self.device.detach_kernel_driver(0)
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar acceder al dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                    return False
+                else:
+                    logger.error(f"✗ Error al manipular driver del kernel: {str(e)}")
+                    return False
+
+            # Establecer configuración
+            try:
+                self.device.set_configuration()
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar configurar el dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    return False
+                else:
+                    logger.error(f"✗ Error al configurar el dispositivo: {str(e)}")
+                    return False
+
+            # Obtener interface y endpoints
+            cfg = self.device.get_active_configuration()
+            intf = cfg[(0,0)]
+
+            # Encontrar endpoints
+            self.endpoint_out = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e: \
+                    usb.util.endpoint_direction(e.bEndpointAddress) == \
+                    usb.util.ENDPOINT_OUT
+            )
+
+            self.endpoint_in = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e: \
+                    usb.util.endpoint_direction(e.bEndpointAddress) == \
+                    usb.util.ENDPOINT_IN
+            )
+
+            if self.endpoint_out is None:
+                logger.error("✗ No se encontró endpoint de salida")
+                return False
+
+            logger.info(f"✓ Endpoint OUT: {self.endpoint_out.bEndpointAddress}")
+            if self.endpoint_in:
+                logger.info(f"✓ Endpoint IN: {self.endpoint_in.bEndpointAddress}")
+
+            logger.info("✓ Impresora conectada via USB exitosamente!")
+            return True
+
+        except Exception as e:
+            logger.error(f"✗ Error al configurar dispositivo USB: {str(e)}")
+            logger.info("  Intentando conexión serial en su lugar...")
+            return self._connect_serial_printer()
+
+    def _connect_serial_printer(self) -> bool:
+        """Intenta conectar la impresora como puerto serial (útil en Windows)"""
+        try:
+            logger.info("Buscando impresora TSC TX200 como puerto serial...")
+
+            # Buscar puertos seriales disponibles
+            available_ports = []
+            all_ports = []
+
+            # Obtener todos los puertos y mostrar información detallada
+            for port in serial.tools.list_ports.comports():
+                all_ports.append({
+                    'device': port.device,
+                    'description': port.description,
+                    'hwid': port.hwid,
+                    'vid': port.vid,
+                    'pid': port.pid
+                })
+                logger.info(f"  Puerto encontrado: {port.device} - {port.description} | VID: {port.vid}, PID: {port.pid}")
+
+                # Buscar puertos que podrían ser la impresora TSC
+                # Buscar por VID/PID específicos
+                if port.vid == 0x1203 and port.pid == 0x0230:
+                    available_ports.append(port.device)
+                    logger.info(f"  ✓ Puerto coincide con TSC TX200: {port.device}")
+                # Buscar por descripción que contenga términos relacionados
+                elif any(keyword in port.description.upper() for keyword in ['TSC', 'USB', 'SERIAL', 'PRINTER']):
+                    available_ports.append(port.device)
+                    logger.info(f"  → Puerto potencial (por descripción): {port.device}")
+                # En Windows, también buscar puertos genéricos COM que podrían ser la impresora
+                elif 'COM' in port.device.upper():
+                    available_ports.append(port.device)
+                    logger.info(f"  → Puerto COM potencial: {port.device}")
+
+            logger.info(f"  Total puertos encontrados: {len(all_ports)}")
+            logger.info(f"  Puertos potenciales para TSC: {available_ports}")
+
+            # Si no encontramos puertos específicos, intentar con todos los disponibles
+            if not available_ports:
+                logger.info("  No se encontraron puertos específicos para TSC, intentando con todos los puertos...")
+                available_ports = [port.device for port in serial.tools.list_ports.comports()]
+
+            if not available_ports:
+                logger.warning("✗ No se encontraron puertos seriales en el sistema")
+                logger.info("  Asegúrate de que:")
+                logger.info("  1. La impresora esté físicamente conectada")
+                logger.info("  2. Los drivers de la impresora estén instalados")
+                logger.info("  3. Tengas permisos para acceder a puertos seriales")
+                return False
+
+            # Intentar conectar a cada puerto disponible
+            for port in available_ports:
+                try:
+                    logger.info(f"  Intentando conectar a {port}...")
+                    self.serial_connection = serial.Serial(
+                        port=port,
+                        baudrate=9600,  # Configuración específica para esta impresora
+                        bytesize=8,
+                        parity='N',
+                        stopbits=1,
+                        timeout=2  # Aumentar timeout
+                    )
+
+                    # Verificar si la conexión es exitosa
+                    if self.serial_connection.is_open:
+                        logger.info(f"✓ Conexión serial exitosa a {port}")
+                        logger.info(f"  Configuración: 9600 baud, 8N1")
+                        self.is_usb_connection = False
+                        return True
+                    else:
+                        logger.warning(f"  Conexión no abierta para {port}")
+                        if self.serial_connection.is_open:
+                            self.serial_connection.close()
+
+                except serial.SerialException as se:
+                    logger.warning(f"  Error de puerto serial en {port}: {str(se)}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"  Error general al conectar a {port}: {str(e)}")
+                    continue
+
+            logger.error("✗ No se pudo conectar a la impresora como puerto serial")
+            logger.info("  Verifica que la impresora esté encendida y correctamente conectada")
+            return False
+
+        except Exception as e:
+            logger.error(f"✗ Error intentando conexión serial: {str(e)}")
+            return False
+
+    def enviar_comando(self, comando: str) -> bool:
+        """Envía comando TSPL2 a la impresora (USB o serial)"""
+        if self.is_usb_connection:
+            # Modo USB
+            if not self.device or not self.endpoint_out:
+                logger.error("✗ Dispositivo USB no conectado")
+                return False
+
+            try:
+                # Convertir comando a bytes
+                if isinstance(comando, str):
+                    comando = comando.encode('utf-8')
+
+                # Enviar comando
+                bytes_escritos = self.endpoint_out.write(comando)
+                logger.debug(f"✓ Enviados {bytes_escritos} bytes via USB: {comando.decode('utf-8').strip()}")
+                return True
+
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar enviar comando al dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                    return False
+                else:
+                    logger.error(f"✗ Error de USB al enviar comando: {str(e)}")
+                    return False
+            except Exception as e:
+                logger.error(f"✗ Error enviando comando via USB: {str(e)}")
+                return False
+        else:
+            # Modo serial
+            if not self.serial_connection or not self.serial_connection.is_open:
+                logger.error("✗ Conexión serial no establecida")
+                return False
+
+            try:
+                # Convertir comando a bytes
+                if isinstance(comando, str):
+                    comando = comando.encode('utf-8')
+
+                # Enviar comando
+                bytes_escritos = self.serial_connection.write(comando)
+                self.serial_connection.flush()  # Asegurar que los datos se envíen
+                logger.debug(f"✓ Enviados {bytes_escritos} bytes via serial: {comando.decode('utf-8').strip()}")
+                return True
+
+            except serial.SerialException as e:
+                logger.error(f"✗ Error de puerto serial al enviar comando: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"✗ Error enviando comando via serial: {str(e)}")
+                return False
+    
+    def print_label(self, content: str, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
+        """Imprime etiqueta con el contenido TSPL2 proporcionado, enviando todo en un solo bloque."""
+        try:
+            # Auto-conectar si no hay un dispositivo activo
+            if (self.is_usb_connection and (not self.device or not self.endpoint_out)) or \
+               (not self.is_usb_connection and (not self.serial_connection or not self.serial_connection.is_open)):
+                logger.info("Impresora no conectada, intentando auto-conectar...")
+                if not self.connect_usb_printer():
+                    logger.error("✗ Fallo al auto-conectar con la impresora.")
+                    return False
+
+            logger.info(f"=== IMPRIMIENDO ETIQUETA (BLOQUE UNICO) ===")
+            logger.info(f"Tamaño: {ancho_mm}x{alto_mm}mm")
+            logger.info(f"{'USB' if self.is_usb_connection else 'SERIAL'}: Contenido completo enviado:\n{content}")
+
+            # Enviar el bloque completo de comandos de una sola vez
+            if self.enviar_comando(content):
+                logger.info("✓ Bloque de comandos enviado a impresora correctamente.")
+                return True
+            else:
+                logger.error("✗ Falló el envío del bloque de comandos.")
+                return False
+
+        except Exception as e:
+            logger.error(f"✗ Error durante la impresión de etiqueta: {str(e)}")
+            return False
+    
+    def test_impresora(self, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
+        """Test básico usando comandos exactos de scaner.py"""
+        try:
+            if (self.is_usb_connection and (not self.device or not self.endpoint_out)) or \
+               (not self.is_usb_connection and (not self.serial_connection or not self.serial_connection.is_open)):
+                logger.error("✗ Dispositivo no conectado")
+                return False
+
+            logger.info("=== TEST DE IMPRESORA ===")
+            logger.info(f"Configurando para papel: {ancho_mm}mm x {alto_mm}mm")
+
+            # Comandos de test exactos de tu scaner.py
+            comandos_test = [
+                f"SIZE {ancho_mm} mm, {alto_mm} mm\n",     # Tamaño del papel
+                "GAP 2 mm, 0 mm\n",                       # Espacio entre etiquetas
+                "DIRECTION 1,0\n",                        # Dirección normal
+                "REFERENCE 0,0\n",                        # Punto de referencia en esquina
+                "OFFSET 0 mm\n",                          # Sin offset
+                "SET PEEL OFF\n",                         # Modo peeling desactivado
+                "SET CUTTER OFF\n",                       # Cortador desactivado
+                "SET PARTIAL_CUTTER OFF\n",               # Cortador parcial desactivado
+                "SET TEAR ON\n",                          # Modo tear activado
+                "CLS\n",                                  # Limpiar buffer de impresión
+                "CODEPAGE 1252\n",                        # Página de códigos occidental
+
+                # Texto centrado y bien posicionado como en scaner.py
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*1.5)},\"4\",0,1,1,\"TSC TX200 TEST\"\n",
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*2.5)},\"3\",0,1,1,\"Papel: {ancho_mm}x{alto_mm}mm\"\n",
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*3.5)},\"2\",0,1,1,\"Configuracion OK!\"\n",
+
+                # Línea de separación
+                f"BAR {int(ancho_mm*1.5)},{int(alto_mm*4.5)},{int(ancho_mm*5)},2\n",
+
+                # Información de fecha/hora
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*5.5)},\"1\",0,1,1,\"{time.strftime('%Y-%m-%d %H:%M')}\"\n",
+
+                "PRINT 1,1\n"                             # Imprimir 1 copia
+            ]
+
+            logger.info("Enviando comandos de test...")
+            for i, comando in enumerate(comandos_test, 1):
+                logger.info(f"{i:2d}. {comando.strip()}")
+                if self.enviar_comando(comando):
+                    if self.is_usb_connection:
+                        time.sleep(0.1)  # Pequeña pausa entre comandos para USB
+                    else:
+                        time.sleep(0.05)  # Pausa más corta para serial
+                else:
+                    logger.error(f"✗ Error enviando comando {i}: {comando.strip()}")
+                    return False
+
+            logger.info(f"✓ Test completado para papel {ancho_mm}x{alto_mm}mm")
+            logger.info("La etiqueta debería salir completa y centrada.")
+            return True
+
+        except usb.core.USBError as e:
+            if e.errno == 13:  # Permission denied
+                logger.error("✗ Error de permisos durante la impresión de prueba")
+                logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                return False
+            else:
+                logger.error(f"✗ Error de USB durante la impresión de prueba: {str(e)}")
+                return False
+        except serial.SerialException as e:
+            logger.error(f"✗ Error de puerto serial durante la impresión de prueba: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"✗ Error durante la impresión de prueba: {str(e)}")
+            return False
+    
+    def disconnect(self):
+        """Desconecta de la impresora (USB o serial)"""
+        if self.is_usb_connection and self.device:
+            try:
+                usb.util.dispose_resources(self.device)
+                logger.info("✓ Desconectado de la impresora USB")
+            except Exception as e:
+                logger.warning(f"Error desconectando USB: {str(e)}")
+            finally:
+                self.device = None
+                self.endpoint_out = None
+                self.endpoint_in = None
+        elif not self.is_usb_connection and self.serial_connection:
+            try:
+                self.serial_connection.close()
+                logger.info("✓ Desconectado de la impresora serial")
+            except Exception as e:
+                logger.warning(f"Error desconectando serial: {str(e)}")
+            finally:
+                self.serial_connection = None
+
+        # Resetear el tipo de conexión
+        self.is_usb_connection = False
+
+# Instancias globales
+scale_manager = ScaleManager()
+printer_manager = PrinterManager()
+
+# Endpoints REST
+@app.route('/')
+def index():
+    """Página principal del monitor serial"""
+    return render_template('index.html')
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de salud del servidor"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'services': {
+            'scale': scale_manager.is_running,
+            'printer': printer_manager.device is not None
+        }
+    })
+
+@app.route('/scale/connect', methods=['POST'])
+def connect_scale():
+    """Conecta a la báscula"""
+    data = request.get_json() or {}
+    port = data.get('port', 'COM3')
+    baudrate = data.get('baudrate', 115200)
+    
+    scale_manager.port = port
+    scale_manager.baudrate = baudrate
+    
+    if scale_manager.connect():
+        return jsonify({'status': 'success', 'message': 'Báscula conectada'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error conectando báscula'}), 500
+
+@app.route('/scale/disconnect', methods=['POST'])
+def disconnect_scale():
+    """Desconecta la báscula"""
+    scale_manager.stop_continuous_reading()
+    scale_manager.disconnect()
+    response = jsonify({'status': 'success', 'message': 'Báscula desconectada'})
+    response.headers.add('Access-Control-Allow-Origin', '*') # Add this line
+    return response
+
+@app.route('/scale/start', methods=['POST'])
+def start_scale_reading():
+    """Inicia lectura continua de la báscula"""
+    if not scale_manager.serial_connection:
+        return jsonify({'status': 'error', 'message': 'Báscula no conectada'}), 400
+    
+    scale_manager.start_continuous_reading()
+    return jsonify({'status': 'success', 'message': 'Lectura continua iniciada'})
+
+@app.route('/scale/stop', methods=['POST'])
+def stop_scale_reading():
+    """Detiene lectura continua de la báscula"""
+    scale_manager.stop_continuous_reading()
+    return jsonify({'status': 'success', 'message': 'Lectura continua detenida'})
+
+@app.route('/scale/read', methods=['GET'])
+def read_scale():
+    """Lee peso actual de la báscula"""
+    reading = scale_manager.read_weight(timeout=10) # Wait up to 10 seconds
+    if reading:
+        return jsonify({
+            'status': 'success',
+            'weight': reading.weight,
+            'timestamp': reading.timestamp
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'No se pudo leer la báscula'}), 500
+
+@app.route('/scale/last', methods=['GET'])
+def get_last_reading():
+    """Obtiene última lectura de la báscula"""
+    if scale_manager.last_reading:
+        return jsonify({
+            'status': 'success',
+            'weight': scale_manager.last_reading.weight,
+            'timestamp': scale_manager.last_reading.timestamp
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'No hay lecturas disponibles'}), 404
+
+@app.route('/scale/latest', methods=['GET'])
+def get_latest_from_queue():
+    """Obtiene lecturas más recientes de la cola"""
+    readings = []
+    try:
+        while not scale_data_queue.empty():
+            reading = scale_data_queue.get_nowait()
+            readings.append({
+                'weight': reading.weight,
+                'timestamp': reading.timestamp,
+                'status': reading.status
+            })
+            # También imprimir en consola para debugging
+            print(f"\033[94m[API REQUEST]\033[0m [{reading.timestamp}] Peso: \033[93m{reading.weight}\033[0m")
+    except queue.Empty:
+        pass
+    
+    return jsonify({'status': 'success', 'readings': readings})
+
+@app.route('/printer/connect', methods=['POST'])
+def connect_printer():
+    """Conecta a la impresora"""
+    if printer_manager.connect_usb_printer():
+        connection_type = "USB" if printer_manager.is_usb_connection else "Serial"
+        return jsonify({'status': 'success', 'message': f'Impresora conectada via {connection_type}', 'connection_type': connection_type})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
+
+@app.route('/connect', methods=['POST'])
+def connect_port():
+    """Conecta a un puerto serial o dispositivo USB"""
+    data = request.get_json()
+    if not data or 'port' not in data:
+        return jsonify({'status': 'error', 'message': 'Puerto requerido'}), 400
+
+    port = data['port']
+
+    # Si es la impresora USB, usar la conexión USB directa
+    if port == 'USB://TSC-TX200-0x0230':
+        if printer_manager.connect_usb_printer():
+            connection_type = "USB" if printer_manager.is_usb_connection else "Serial"
+            return jsonify({'status': 'success', 'message': f'Impresora conectada via {connection_type}', 'connection_type': connection_type})
+        else:
+            return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
+    else:
+        # Para otros puertos seriales tradicionales
+        try:
+            # Configurar el puerto en el manager de báscula
+            scale_manager.port = port
+            if scale_manager.connect():
+                return jsonify({'status': 'success', 'message': 'Conexión serial establecida'})
+            else:
+                return jsonify({'status': 'error', 'message': f'Error conectando al puerto {port}'}), 500
+        except Exception as e:
+            logger.error(f"Error conectando al puerto {port}: {str(e)}")
+            return jsonify({'status': 'error', 'message': f'Error conectando al puerto: {str(e)}'}), 500
+
+@app.route('/printer/print', methods=['POST'])
+def print_label():
+    """Imprime etiqueta"""
+    data = request.get_json()
+    if not data or 'content' not in data:
+        return jsonify({'status': 'error', 'message': 'Contenido requerido'}), 400
+    
+    content = data['content']
+    ancho_mm = data.get('ancho_mm', 80)
+    alto_mm = data.get('alto_mm', 50)
+    
+    if printer_manager.print_label(content, ancho_mm, alto_mm):
+        return jsonify({'status': 'success', 'message': 'Etiqueta impresa'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error imprimiendo'}), 500
+
+@app.route('/printer/test', methods=['POST'])
+def test_printer():
+    """Ejecuta test de impresora"""
+    data = request.get_json() or {}
+    ancho_mm = data.get('ancho_mm', 80)
+    alto_mm = data.get('alto_mm', 50)
+    
+    if printer_manager.test_impresora(ancho_mm, alto_mm):
+        return jsonify({'status': 'success', 'message': 'Test de impresora ejecutado'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error en test de impresora'}), 500
+
+@app.route('/printer/disconnect', methods=['POST'])
+def disconnect_printer():
+    """Desconecta la impresora"""
+    printer_manager.disconnect()
+    return jsonify({'status': 'success', 'message': 'Impresora desconectada'})
+
+@app.route('/ports', methods=['GET'])
+def list_serial_ports():
+    """Lista puertos seriales disponibles"""
+    ports = []
+    try:
+        for port in serial.tools.list_ports.comports():
+            ports.append({
+                'device': port.device,
+                'description': port.description,
+                'hwid': port.hwid,
+                'vid': port.vid,
+                'pid': port.pid
+            })
+            logger.info(f"Puerto encontrado: {port.device} - {port.description} (VID: {port.vid}, PID: {port.pid})")
+    except Exception as e:
+        logger.error(f"Error listando puertos seriales: {str(e)}")
+        # Aún así intentar devolver cualquier puerto que se haya encontrado antes del error
+
+    # Agregar dispositivo USB de la impresora TSC TX200 si está conectado
+    try:
+        # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+        tsc_device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+        if tsc_device is not None:
+            ports.append({
+                'device': 'USB://TSC-TX200-0x0230',
+                'description': 'TSC TX200 USB Printer',
+                'hwid': 'USB VID:PID=1203:0230',
+                'vid': 0x1203,
+                'pid': 0x0230
+            })
+            logger.info("Dispositivo TSC TX200 encontrado via USB")
+    except Exception as e:
+        logger.warning(f"Error buscando dispositivo TSC via USB: {str(e)}")
+
+    logger.info(f"Total de puertos encontrados: {len(ports)}")
+    return jsonify({'status': 'success', 'ports': ports, 'total': len(ports)})
+
+def diagnosticar_puertos():
+    """Diagnóstico de puertos seriales y dispositivos USB"""
+    print("=" * 60)
+    print("DIAGNÓSTICO DE PUERTOS SERIALES Y DISPOSITIVOS USB")
+    print("=" * 60)
+
+    # 1. Listar todos los puertos seriales
+    print("\n1. PUERTOS SERIALES DISPONIBLES:")
+    print("-" * 40)
+
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("   ✗ No se encontraron puertos seriales en el sistema")
+            print("   Esto podría deberse a:")
+            print("   - Impresora no conectada físicamente")
+            print("   - Drivers no instalados correctamente")
+            print("   - Problemas de permisos")
+        else:
+            for i, port in enumerate(ports, 1):
+                print(f"   {i}. {port.device}")
+                print(f"      Descripción: {port.description}")
+                print(f"      HWID: {port.hwid}")
+                print(f"      VID:PID: {port.vid}:{port.pid}")
+                print()
+    except Exception as e:
+        print(f"   Error al listar puertos seriales: {str(e)}")
+
+    # 2. Buscar dispositivos USB específicos
+    print("2. DISPOSITIVOS USB CON VID/PID CONOCIDOS:")
+    print("-" * 40)
+
+    try:
+        # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+        tsc_device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+        if tsc_device:
+            print(f"   ✓ TSC TX200 encontrado:")
+            print(f"     Vendor ID: 0x{tsc_device.idVendor:04x}")
+            print(f"     Product ID: 0x{tsc_device.idProduct:04x}")
+            print(f"     Device Bus: {tsc_device.bus}")
+            print(f"     Device Address: {tsc_device.address}")
+        else:
+            print("   ✗ TSC TX200 no encontrado via USB")
+    except Exception as e:
+        print(f"   ✗ Error buscando dispositivo TSC via USB: {str(e)}")
+
+    # 3. Recomendaciones
+    print("\n3. RECOMENDACIONES:")
+    print("-" * 40)
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("   • Verifica que la impresora esté físicamente conectada")
+            print("   • Asegúrate de que los drivers estén instalados")
+            print("   • En Windows, revisa el Administrador de Dispositivos")
+            print("   • En Linux/Mac, verifica permisos (puede necesitar sudo)")
+        else:
+            print("   • La impresora puede aparecer como un puerto COM (Windows) o /dev/tty* (Linux/Mac)")
+            print("   • Busca puertos con descripciones como 'USB', 'Serial', 'TSC' o 'Printer'")
+    except:
+        print("   • No se pudieron obtener los puertos seriales")
+
+    print("\n" + "=" * 60)
+
+# Endpoint para diagnóstico
+@app.route('/diagnostico', methods=['GET'])
+def endpoint_diagnostico():
+    """Endpoint para diagnóstico de puertos"""
+    import io
+    import sys
+
+    # Capturar la salida del diagnóstico
+    old_stdout = sys.stdout
+    sys.stdout = buffer = io.StringIO()
+
+    try:
+        diagnosticar_puertos()
+        output = buffer.getvalue()
+    finally:
+        sys.stdout = old_stdout
+
+    return jsonify({'status': 'success', 'diagnostico': output})
+
+import argparse
+
+# ... (existing imports)
+
+# ... (existing code)
+
+def start_ngrok_tunnel():
+    """Inicia el túnel ngrok para exponer el servidor local"""
+    try:
+        # Iniciar ngrok en segundo plano para exponer el puerto 5000
+        ngrok_process = subprocess.Popen(['ngrok', 'http', '--url=https://pregeological-nonidentical-ines.ngrok-free.app', '5000'])
+
+        # Esperar un momento para que ngrok inicie
+        time.sleep(3)
+
+        # Registrar la función para terminar ngrok cuando el script termine
+        def cleanup():
+            ngrok_process.terminate()
+            ngrok_process.wait()
+
+        atexit.register(cleanup)
+
+        logger.info("✓ Túnel ngrok iniciado exitosamente")
+        logger.info("✓ Abriendo navegador con la URL pública...")
+
+        # Abrir el navegador con la URL del cliente
+        webbrowser.open('https://wmsys.fly.dev')
+
+        return ngrok_process
+
+    except FileNotFoundError:
+        logger.error("✗ ngrok no encontrado. Asegúrate de tener ngrok instalado y en el PATH.")
+        logger.error("   Puedes descargarlo desde: https://ngrok.com/download")
+        return None
+    except Exception as e:
+        logger.error(f"✗ Error iniciando túnel ngrok: {str(e)}")
+        return None
+
+# Servidor de desarrollo con auto-reload
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Servidor Flask para comunicación serial.')
+    parser.add_argument('--port', type=str, default='COM3', help='Puerto serial')
+    parser.add_argument('--baudrate', type=int, default=115200, help='Baud rate')
+    parser.add_argument('--parity', type=str, default='N', help='Paridad (N, E, O)')
+    parser.add_argument('--stopbits', type=int, default=1, help='Bits de parada')
+    parser.add_argument('--bytesize', type=int, default=8, help='Bits de datos')
+    parser.add_argument('--diagnostico', action='store_true', help='Ejecutar diagnóstico de puertos y salir')
+    args = parser.parse_args()
+
+    if args.diagnostico:
+        diagnosticar_puertos()
+        sys.exit(0)
+
+    scale_manager.port = args.port
+    scale_manager.baudrate = args.baudrate
+    scale_manager.parity = args.parity
+    scale_manager.stopbits = args.stopbits
+    scale_manager.bytesize = args.bytesize
+
+    logger.info("=== Servidor Flask para Comunicación Serial ===")
+    logger.info("Compatible con TSC TX200 y báscula serial")
+    logger.info("===============================================")
+    logger.info("Endpoints disponibles:")
+    logger.info("  GET  /health - Estado del servidor")
+    logger.info("  GET  /ports - Puertos seriales disponibles")
+    logger.info("  GET  /diagnostico - Diagnóstico completo de puertos y dispositivos")
+    logger.info("  POST /connect - Conectar a puerto serial o dispositivo USB")
+    logger.info("")
+    logger.info("BÁSCULA:")
+    logger.info("  POST /scale/connect - Conectar báscula")
+    logger.info("  POST /scale/start - Iniciar lectura continua")
+    logger.info("  POST /scale/stop - Detener lectura")
+    logger.info("  GET  /scale/read - Leer peso actual")
+    logger.info("  GET  /scale/last - Última lectura")
+    logger.info("  GET  /scale/latest - Lecturas de la cola")
+    logger.info("  GET  /scale/get_weight_now - Obtener peso con timeout")
+    logger.info("")
+    logger.info("IMPRESORA TSC TX200:")
+    logger.info("  POST /printer/connect - Conectar impresora USB")
+    logger.info("  POST /printer/print - Imprimir etiqueta")
+    logger.info("  POST /printer/test - Test de impresión")
+    logger.info("  POST /printer/disconnect - Desconectar impresora")
+    logger.info("===============================================")
+
+    logger.info("Ejecutando diagnóstico de puertos...")
+    diagnosticar_puertos()
+    logger.info("Fin del diagnóstico.")
+
+    # Iniciar el túnel ngrok en un hilo separado después de que Flask esté listo
+    def start_ngrok_after_flask():
+        time.sleep(2)  # Esperar a que Flask inicie
+        start_ngrok_tunnel()
+
+    # Iniciar Flask en un hilo separado para poder iniciar ngrok después
+    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Iniciar ngrok después de que Flask esté listo
+    start_ngrok_after_flask()
+
+    # Mantener el hilo principal vivo
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Cerrando servidor...")
+        sys.exit(0)
