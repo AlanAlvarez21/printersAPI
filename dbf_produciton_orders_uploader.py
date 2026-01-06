@@ -257,14 +257,43 @@ class PrinterManager:
 
             # Buscar puertos seriales disponibles
             available_ports = []
+            all_ports = []
+
+            # Obtener todos los puertos y mostrar información detallada
             for port in serial.tools.list_ports.comports():
+                all_ports.append({
+                    'device': port.device,
+                    'description': port.description,
+                    'hwid': port.hwid,
+                    'vid': port.vid,
+                    'pid': port.pid
+                })
+                logger.info(f"  Puerto encontrado: {port.device} - {port.description} | VID: {port.vid}, PID: {port.pid}")
+
                 # Buscar puertos que podrían ser la impresora TSC
-                if 'USB' in port.description or 'Serial' in port.description or port.vid == 0x1203:
+                # Buscar por VID/PID específicos
+                if port.vid == 0x1203 and port.pid == 0x0230:
                     available_ports.append(port.device)
-                    logger.info(f"  Encontrado puerto potencial: {port.device} - {port.description}")
+                    logger.info(f"  ✓ Puerto coincide con TSC TX200: {port.device}")
+                # Buscar por descripción que contenga términos relacionados
+                elif any(keyword in port.description.upper() for keyword in ['TSC', 'USB', 'SERIAL', 'PRINTER']):
+                    available_ports.append(port.device)
+                    logger.info(f"  → Puerto potencial (por descripción): {port.device}")
+
+            logger.info(f"  Total puertos encontrados: {len(all_ports)}")
+            logger.info(f"  Puertos potenciales para TSC: {available_ports}")
+
+            # Si no encontramos puertos específicos, intentar con todos los disponibles
+            if not available_ports:
+                logger.info("  No se encontraron puertos específicos para TSC, intentando con todos los puertos...")
+                available_ports = [port.device for port in serial.tools.list_ports.comports()]
 
             if not available_ports:
-                logger.warning("✗ No se encontraron puertos seriales que puedan ser la impresora TSC")
+                logger.warning("✗ No se encontraron puertos seriales en el sistema")
+                logger.info("  Asegúrate de que:")
+                logger.info("  1. La impresora esté físicamente conectada")
+                logger.info("  2. Los drivers de la impresora estén instalados")
+                logger.info("  3. Tengas permisos para acceder a puertos seriales")
                 return False
 
             # Intentar conectar a cada puerto disponible
@@ -277,19 +306,29 @@ class PrinterManager:
                         bytesize=8,
                         parity='N',
                         stopbits=1,
-                        timeout=1
+                        timeout=2  # Aumentar timeout
                     )
 
                     # Verificar si la conexión es exitosa
                     if self.serial_connection.is_open:
                         logger.info(f"✓ Conexión serial exitosa a {port}")
+                        logger.info(f"  Configuración: 115200 baud, 8N1")
                         self.is_usb_connection = False
                         return True
+                    else:
+                        logger.warning(f"  Conexión no abierta para {port}")
+                        if self.serial_connection.is_open:
+                            self.serial_connection.close()
+
+                except serial.SerialException as se:
+                    logger.warning(f"  Error de puerto serial en {port}: {str(se)}")
+                    continue
                 except Exception as e:
-                    logger.warning(f"  Fallo al conectar a {port}: {str(e)}")
+                    logger.warning(f"  Error general al conectar a {port}: {str(e)}")
                     continue
 
             logger.error("✗ No se pudo conectar a la impresora como puerto serial")
+            logger.info("  Verifica que la impresora esté encendida y correctamente conectada")
             return False
 
         except Exception as e:
@@ -653,12 +692,19 @@ def disconnect_printer():
 def list_serial_ports():
     """Lista puertos seriales disponibles"""
     ports = []
-    for port in serial.tools.list_ports.comports():
-        ports.append({
-            'device': port.device,
-            'description': port.description,
-            'hwid': port.hwid
-        })
+    try:
+        for port in serial.tools.list_ports.comports():
+            ports.append({
+                'device': port.device,
+                'description': port.description,
+                'hwid': port.hwid,
+                'vid': port.vid,
+                'pid': port.pid
+            })
+            logger.info(f"Puerto encontrado: {port.device} - {port.description} (VID: {port.vid}, PID: {port.pid})")
+    except Exception as e:
+        logger.error(f"Error listando puertos seriales: {str(e)}")
+        # Aún así intentar devolver cualquier puerto que se haya encontrado antes del error
 
     # Agregar dispositivo USB de la impresora TSC TX200 si está conectado
     try:
@@ -668,12 +714,99 @@ def list_serial_ports():
             ports.append({
                 'device': 'USB://TSC-TX200-0x0230',
                 'description': 'TSC TX200 USB Printer',
-                'hwid': 'USB VID:PID=1203:0230'
+                'hwid': 'USB VID:PID=1203:0230',
+                'vid': 0x1203,
+                'pid': 0x0230
             })
+            logger.info("Dispositivo TSC TX200 encontrado via USB")
     except Exception as e:
-        logger.warning(f"Error buscando dispositivo TSC: {str(e)}")
+        logger.warning(f"Error buscando dispositivo TSC via USB: {str(e)}")
 
-    return jsonify({'status': 'success', 'ports': ports})
+    logger.info(f"Total de puertos encontrados: {len(ports)}")
+    return jsonify({'status': 'success', 'ports': ports, 'total': len(ports)})
+
+def diagnosticar_puertos():
+    """Diagnóstico de puertos seriales y dispositivos USB"""
+    print("=" * 60)
+    print("DIAGNÓSTICO DE PUERTOS SERIALES Y DISPOSITIVOS USB")
+    print("=" * 60)
+
+    # 1. Listar todos los puertos seriales
+    print("\n1. PUERTOS SERIALES DISPONIBLES:")
+    print("-" * 40)
+
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("   ✗ No se encontraron puertos seriales en el sistema")
+            print("   Esto podría deberse a:")
+            print("   - Impresora no conectada físicamente")
+            print("   - Drivers no instalados correctamente")
+            print("   - Problemas de permisos")
+        else:
+            for i, port in enumerate(ports, 1):
+                print(f"   {i}. {port.device}")
+                print(f"      Descripción: {port.description}")
+                print(f"      HWID: {port.hwid}")
+                print(f"      VID:PID: {port.vid}:{port.pid}")
+                print()
+    except Exception as e:
+        print(f"   Error al listar puertos seriales: {str(e)}")
+
+    # 2. Buscar dispositivos USB específicos
+    print("2. DISPOSITIVOS USB CON VID/PID CONOCIDOS:")
+    print("-" * 40)
+
+    try:
+        # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+        tsc_device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+        if tsc_device:
+            print(f"   ✓ TSC TX200 encontrado:")
+            print(f"     Vendor ID: 0x{tsc_device.idVendor:04x}")
+            print(f"     Product ID: 0x{tsc_device.idProduct:04x}")
+            print(f"     Device Bus: {tsc_device.bus}")
+            print(f"     Device Address: {tsc_device.address}")
+        else:
+            print("   ✗ TSC TX200 no encontrado via USB")
+    except Exception as e:
+        print(f"   ✗ Error buscando dispositivo TSC via USB: {str(e)}")
+
+    # 3. Recomendaciones
+    print("\n3. RECOMENDACIONES:")
+    print("-" * 40)
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("   • Verifica que la impresora esté físicamente conectada")
+            print("   • Asegúrate de que los drivers estén instalados")
+            print("   • En Windows, revisa el Administrador de Dispositivos")
+            print("   • En Linux/Mac, verifica permisos (puede necesitar sudo)")
+        else:
+            print("   • La impresora puede aparecer como un puerto COM (Windows) o /dev/tty* (Linux/Mac)")
+            print("   • Busca puertos con descripciones como 'USB', 'Serial', 'TSC' o 'Printer'")
+    except:
+        print("   • No se pudieron obtener los puertos seriales")
+
+    print("\n" + "=" * 60)
+
+# Endpoint para diagnóstico
+@app.route('/diagnostico', methods=['GET'])
+def endpoint_diagnostico():
+    """Endpoint para diagnóstico de puertos"""
+    import io
+    import sys
+
+    # Capturar la salida del diagnóstico
+    old_stdout = sys.stdout
+    sys.stdout = buffer = io.StringIO()
+
+    try:
+        diagnosticar_puertos()
+        output = buffer.getvalue()
+    finally:
+        sys.stdout = old_stdout
+
+    return jsonify({'status': 'success', 'diagnostico': output})
 
 import argparse
 
@@ -721,7 +854,12 @@ if __name__ == '__main__':
     parser.add_argument('--parity', type=str, default='N', help='Paridad (N, E, O)')
     parser.add_argument('--stopbits', type=int, default=1, help='Bits de parada')
     parser.add_argument('--bytesize', type=int, default=8, help='Bits de datos')
+    parser.add_argument('--diagnostico', action='store_true', help='Ejecutar diagnóstico de puertos y salir')
     args = parser.parse_args()
+
+    if args.diagnostico:
+        diagnosticar_puertos()
+        sys.exit(0)
 
     scale_manager.port = args.port
     scale_manager.baudrate = args.baudrate
@@ -735,6 +873,7 @@ if __name__ == '__main__':
     logger.info("Endpoints disponibles:")
     logger.info("  GET  /health - Estado del servidor")
     logger.info("  GET  /ports - Puertos seriales disponibles")
+    logger.info("  GET  /diagnostico - Diagnóstico completo de puertos y dispositivos")
     logger.info("  POST /connect - Conectar a puerto serial o dispositivo USB")
     logger.info("")
     logger.info("BÁSCULA:")
@@ -752,6 +891,10 @@ if __name__ == '__main__':
     logger.info("  POST /printer/test - Test de impresión")
     logger.info("  POST /printer/disconnect - Desconectar impresora")
     logger.info("===============================================")
+
+    logger.info("Ejecutando diagnóstico de puertos...")
+    diagnosticar_puertos()
+    logger.info("Fin del diagnóstico.")
 
     # Iniciar el túnel ngrok en un hilo separado después de que Flask esté listo
     def start_ngrok_after_flask():
