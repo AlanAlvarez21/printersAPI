@@ -1,521 +1,630 @@
-import requests
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Servidor Flask para comunicación serial con báscula e impresora
+Integra el script de báscula existente con endpoints REST
+"""
+
+import argparse
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+import threading
 import time
-import logging
-from datetime import datetime
-from dbfread import DBF
-import os
 import json
-import hashlib
+import serial
+import serial.tools.list_ports
+import usb.core
+import usb.util
+from datetime import datetime
+import csv
+import os
 import sys
-from typing import Dict, List, Optional, Any
-import traceback
-import certifi
+import logging
+import queue
+import subprocess
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
-# Fix SSL para PyInstaller
-os.environ['SSL_CERT_FILE'] = certifi.where()
-os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+# Configurar logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Si estamos en un ejecutable de PyInstaller
-if getattr(sys, 'frozen', False):
-    import ssl
-    # Crear contexto SSL apropiado
-    ssl._create_default_https_context = ssl._create_unverified_context
+# Configurar Flask con el directorio de plantillas
+template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+app = Flask(__name__, template_folder=template_dir)
+CORS(app)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ordprod_inventory_uploader.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger('OrdProdInventoryUploader')
+# Variables globales
+scale_data_queue = queue.Queue()
+server_connected = False
+connection_lock = threading.Lock()
+scale_thread = None
+scale_running = False
 
-# API configuration - Using the correct endpoint from your example
-API_BASE_URL = "https://wmsys.fly.dev"  # Local development URL like in your example
-INVENTORY_CODES_ENDPOINT = "/api/inventory_codes"
-API_TIMEOUT = 30
-MAX_RETRIES = 3
+@dataclass
+class ScaleReading:
+    weight: str
+    timestamp: str
+    status: str = "success"
 
-# Configuration - Remove the artificial limit
-CHECK_INTERVAL = 60
-BATCH_SIZE = 50
-MAX_RECORDS_TO_PROCESS = float('inf')  # No limit - process all records
+@dataclass
+class PrintJob:
+    content: str
+    timestamp: str
+    status: str = "pending"
 
-# Ruta del archivo ordprod.dbf
-ORDPROD_DBF_PATH = 'ordprod.dbf'
-
-# File to store last processed state
-STATE_FILE = "ordprod_inventory_state.json"
-
-# Flag to force processing even if file hasn't changed (for testing)
-FORCE_PROCESSING = "--force" in sys.argv
-
-class OrdProdInventoryUploader:
-    def __init__(self):
-        self.state = self.load_state()
-        self.session = requests.Session()
-        # Initialize with a default starting NO_ORDP if not set
-        if 'last_processed_ordp' not in self.state:
-            self.state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
+class ScaleManager:
+    def __init__(self, port='COM3', baudrate=115200, parity='N', stopbits=1, bytesize=8):
+        self.port = port
+        self.baudrate = baudrate
+        self.parity = parity
+        self.stopbits = stopbits
+        self.bytesize = bytesize
+        self.serial_connection = None
+        self.is_running = False
+        self.last_reading = None
         
-    def load_state(self) -> Dict:
-        """Load the last processed state from file"""
+    def connect(self) -> bool:
+        """Conecta a la báscula"""
         try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded state with {len(state)} entries")
-                    # Set default last_processed_ordp if not present
-                    if 'last_processed_ordp' not in state:
-                        state['last_processed_ordp'] = 0  # Starting from 0 means process all initially
-                    return state
-        except Exception as e:
-            logger.warning(f"Could not load state file: {e}")
-        # Default state with starting NO_ORDP
-        return {'last_processed_ordp': 0}
-
-    def save_state(self) -> bool:
-        """Save the current state to file"""
-        try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
-            logger.debug("State saved successfully")
+            # Mostrar puertos disponibles
+            available_ports = serial.tools.list_ports.comports()
+            logger.info("Puertos seriales disponibles:")
+            for port in available_ports:
+                logger.info(f"  - {port.device}")
+            
+            self.serial_connection = serial.Serial(
+                self.port, 
+                baudrate=self.baudrate, 
+                timeout=1, 
+                parity=self.parity, 
+                stopbits=self.stopbits, 
+                bytesize=self.bytesize
+            )
+            logger.info(f"✓ Conexión establecida en el puerto {self.port}")
             return True
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
+            
+        except serial.SerialException as e:
+            logger.error(f"✗ Error de conexión serial: {str(e)}")
             return False
-
-    def is_new_record(self, no_ordp: str) -> bool:
-        """Check if this is a new record based on NO_ORDP sequence"""
-        try:
-            current_ordp = int(no_ordp)
-            last_processed = self.state.get('last_processed_ordp', 0)
-            return current_ordp > last_processed
-        except ValueError:
-            logger.warning(f"Invalid NO_ORDP value: {no_ordp}")
-            return False
-
-    def get_file_hash(self, filepath: str) -> Optional[Dict]:
-        """Get file modification time and size for change detection"""
-        try:
-            stat = os.stat(filepath)
-            return {
-                'mtime': stat.st_mtime,
-                'size': stat.st_size
-            }
-        except Exception as e:
-            logger.error(f"Error getting file hash for {filepath}: {e}")
+    
+    def disconnect(self):
+        """Desconecta la báscula"""
+        if self.serial_connection and self.serial_connection.is_open:
+            self.serial_connection.close()
+            logger.info("✓ Puerto serial cerrado correctamente")
+    
+    def read_weight(self, timeout=5) -> Optional[ScaleReading]:
+        """Lee un peso de la báscula, con un timeout"""
+        if not self.serial_connection or not self.serial_connection.is_open:
+            logger.error("La conexión serial no está abierta.")
             return None
-
-    def clean_value(self, value: Any) -> str:
-        """Clean and convert value to appropriate type"""
-        if value is None or str(value).lower() in ['nan', 'none', '', 'null']:
-            return ''
-        return str(value).strip()
-
-    def map_ordprod_record_to_inventory_code(self, record: Dict) -> Optional[Dict]:
-        """Map ordprod.dbf record to inventory code API format"""
+            
         try:
-            # Convert all values to strings and clean them
-            cleaned_record = {k: self.clean_value(v) for k, v in record.items()}
-            
-            # Map ordprod fields to inventory code fields based on your example
-            mapped_record = {
-                "no_ordp": cleaned_record.get('NO_ORDP', ''),
-                "cve_copr": cleaned_record.get('CVE_COPR', ''),
-                "cve_prod": cleaned_record.get('CVE_PROD', ''),
-                "can_copr": float(cleaned_record.get('CAN_COPR', 0) or 0),
-                "tip_copr": int(float(cleaned_record.get('TIP_COPR', 1) or 1)),
-                "costo": float(cleaned_record.get('COSTO', 0) or 0),
-                "fecha": cleaned_record.get('FECH_CTO', datetime.now().strftime('%Y-%m-%d')),
-                "cve_suc": cleaned_record.get('CVE_SUC', ''),
-                "trans": int(float(cleaned_record.get('TRANS', 0) or 0)),
-                "lote": cleaned_record.get('LOTE', ''),
-                "new_med": cleaned_record.get('NEW_MED', ''),
-                "new_copr": cleaned_record.get('NEW_COPR', ''),
-                "costo_rep": float(cleaned_record.get('COSTO_REP', 0) or 0),
-                "partresp": int(float(cleaned_record.get('PARTRESP', 0) or 0)),
-                "dmov": cleaned_record.get('DMOV', ''),
-                "partop": int(float(cleaned_record.get('PARTOP', 0) or 0)),
-                "fcdres": float(cleaned_record.get('FCDRES', 0) or 0),
-                "undres": cleaned_record.get('UNDRES', ''),
-            }
-            
-            # Remove empty fields to keep payload clean
-            mapped_record = {k: v for k, v in mapped_record.items() 
-                           if v not in [None, '', 0] or k in ['can_copr', 'costo', 'tip_copr', 'trans', 'partresp', 'partop', 'fcdres']}
-            
-            return mapped_record
-            
-        except Exception as e:
-            logger.error(f"Error mapping record to inventory code schema: {e}")
-            logger.error(f"Record data: {record}")
-            return None
-
-    def send_inventory_code_to_api(self, inventory_code_data: Dict) -> Dict:
-        """Send a single inventory code to the API endpoint with retry logic"""
-        for attempt in range(MAX_RETRIES):
-            try:
-                logger.info(f"Sending inventory code NO_ORDP: {inventory_code_data.get('no_ordp', 'N/A')} to API (attempt {attempt + 1})")
-                
-                # Wrap the inventory code data in the expected format (as per your example)
-                payload = {
-                    "inventory_code": inventory_code_data
-                }
-                
-                logger.debug(f"Payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}...")
-                
-                response = self.session.post(
-                    API_BASE_URL + INVENTORY_CODES_ENDPOINT,
-                    json=payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=API_TIMEOUT
-                )
-                
-                logger.info(f"API Response Status: {response.status_code}")
-                
-                if response.status_code in [200, 201]:
-                    try:
-                        result = response.json()
-                        logger.debug(f"API Response: {json.dumps(result, indent=2, ensure_ascii=False)[:500]}...")
-                        logger.info(f"Inventory code sent successfully")
-                        return {"success": True, "data": result}
-                    except Exception as json_error:
-                        logger.error(f"Error parsing JSON response: {json_error}")
-                        logger.error(f"Response text: {response.text[:500]}...")
-                        return {"success": True, "data": {"message": "Success but parsing error"}}
-                elif response.status_code == 409:
-                    # Conflict - inventory code already exists
-                    logger.warning(f"Inventory code already exists: {inventory_code_data.get('no_ordp', 'N/A')}")
-                    return {"success": True, "data": {"message": "Already exists"}}
-                else:
-                    logger.warning(f"API returned {response.status_code}: {response.text}")
-                    if response.status_code == 422:
-                        logger.error("VALIDATION ERROR - Check payload format")
-                        logger.error(f"Full payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 ** attempt)
-                        continue
-                        
-            except requests.exceptions.Timeout:
-                logger.warning(f"Timeout on attempt {attempt + 1}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error on attempt {attempt + 1}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except Exception as e:
-                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                logger.error(traceback.format_exc())
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                    
-        logger.error("Failed to send inventory code after all retries")
-        return {"success": False, "error": "Failed after retries"}
-
-    def send_inventory_codes_batch_to_api(self, batch_data: List[Dict]) -> Dict:
-        """Send a batch of inventory codes to the API endpoint - fallback to individual sends if no batch endpoint exists"""
-        # First try the batch endpoint if it exists
-        for attempt in range(MAX_RETRIES):
-            try:
-                logger.info(f"Sending batch of {len(batch_data)} inventory codes to API")
-                
-                # Create a payload with the batch of inventory codes
-                payload = {
-                    "inventory_codes": batch_data
-                }
-                
-                logger.debug(f"Batch payload: {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}...")
-                
-                response = self.session.post(
-                    API_BASE_URL + INVENTORY_CODES_ENDPOINT + "/batch",  # Try batch endpoint first
-                    json=payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=API_TIMEOUT * 2  # Increase timeout for batch processing
-                )
-                
-                logger.info(f"API Response Status: {response.status_code}")
-                
-                if response.status_code in [200, 201]:
-                    try:
-                        result = response.json()
-                        success_count = result.get('success_count', len(batch_data))
-                        total_count = result.get('total_count', len(batch_data))
-                        logger.info(f"API processed batch: {success_count}/{total_count} records successful")
-                        return {"success": True, "data": result}
-                    except Exception as json_error:
-                        logger.error(f"Error parsing JSON response: {json_error}")
-                        logger.error(f"Response text: {response.text[:500]}...")
-                        return {"success": True, "data": {"message": "Success but parsing error"}}
-                elif response.status_code == 404:
-                    logger.info("Batch endpoint not found, falling back to individual sends")
-                    break  # Break to fallback to individual sends
-                else:
-                    logger.warning(f"API batch returned {response.status_code}: {response.text}")
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 ** attempt)
-                        continue
-                        
-            except requests.exceptions.Timeout:
-                logger.warning(f"Batch timeout on attempt {attempt + 1}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Batch request error on attempt {attempt + 1}: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-            except Exception as e:
-                logger.error(f"Unexpected batch error on attempt {attempt + 1}: {e}")
-                logger.error(traceback.format_exc())
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-        
-        # If batch endpoint doesn't exist or failed, fall back to sending individually
-        logger.info("Falling back to individual sends for batch...")
-        successful_sends = 0
-        results = []
-        
-        for inventory_code_data in batch_data:
-            result = self.send_inventory_code_to_api(inventory_code_data)
-            if result.get("success"):
-                successful_sends += 1
-            results.append(result)
-        
-        return {
-            "success": True,
-            "data": {
-                "success_count": successful_sends,
-                "total_count": len(batch_data),
-                "results": results
-            }
-        }
-
-    def process_ordprod_file(self) -> Dict:
-        """Process ordprod.dbf file and send records as inventory codes to API"""
-        try:
-            logger.info("=" * 60)
-            logger.info(f"ORDPROD INVENTORY CODES PROCESSING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info("=" * 60)
-            
+            logger.info("Esperando datos de la báscula...")
             start_time = time.time()
-            
-            # Check if file exists
-            if not os.path.exists(ORDPROD_DBF_PATH):
-                logger.error(f"File not found: {ORDPROD_DBF_PATH}")
-                return {"status": "error", "message": "File not found"}
-                
-            # Check if file has changed
-            file_info = self.get_file_hash(ORDPROD_DBF_PATH)
-            if not file_info:
-                logger.error(f"Could not get file info for {ORDPROD_DBF_PATH}")
-                return {"status": "error", "message": "Could not get file info"}
-                
-            prev_file_info = self.state.get('file_info', {})
-            logger.info(f"Current file info: mtime={file_info['mtime']}, size={file_info['size']}")
-            logger.info(f"Previous file info: mtime={prev_file_info.get('mtime', 'None')}, size={prev_file_info.get('size', 'None')}")
-            
-            # If file hasn't changed, skip processing (unless force processing is enabled)
-            if (not FORCE_PROCESSING and 
-                file_info['mtime'] == prev_file_info.get('mtime', 0) and 
-                file_info['size'] == prev_file_info.get('size', 0)):
-                logger.info("No changes in ordprod.dbf file")
-                logger.info("=" * 60)
-                logger.info("WAITING FOR NEXT CHECK...")
-                logger.info("=" * 60)
-                return {"status": "completed", "changes_found": False, "records_processed": 0}
-                
-            if FORCE_PROCESSING:
-                logger.info("Force processing enabled - processing all records regardless of changes...")
-                # Reset NO_ORDP tracking to process all records
-                self.state['last_processed_ordp'] = 0
-            else:
-                logger.info("File has been modified - processing new records based on NO_ORDP sequence...")
-            
-            # Open the DBF file
-            logger.info(f"Opening DBF file: {ORDPROD_DBF_PATH}")
-            dbf = DBF(ORDPROD_DBF_PATH, ignore_missing_memofile=True)
-            
-            # Process records based on NO_ORDP sequence (only new records)
-            record_count = 0
-            new_record_count = 0
-            successful_sends = 0
-            total_sent = 0
-            
-            # First, collect all records with NO_ORDP > last_processed_ordp
-            all_records = []
-            highest_ordp = self.state.get('last_processed_ordp', 0)
-            
-            logger.info(f"Analyzing records based on NO_ORDP sequence, last processed: {highest_ordp}")
-            
-            for record in dbf:
-                record_dict = dict(record)
-                no_ordp = self.clean_value(record_dict.get('NO_ORDP', '0'))
-                
-                # Skip records without valid NO_ORDP
-                if not no_ordp or not no_ordp.isdigit():
-                    continue
-                
-                # Only process records with NO_ORDP greater than last processed
-                if self.is_new_record(no_ordp):
-                    mapped_record = self.map_ordprod_record_to_inventory_code(record_dict)
-                    if mapped_record:
-                        all_records.append((int(no_ordp), mapped_record))
-                        new_record_count += 1
+            while time.time() - start_time < timeout:
+                if self.serial_connection.in_waiting > 0:
+                    data = self.serial_connection.readline().decode('utf-8', errors='ignore').strip()
+                    logger.info(f"Datos recibidos: '{data}'")
+
+                    if data:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
-                        # Track the highest NO_ORDP for state update
-                        current_ordp = int(no_ordp)
-                        if current_ordp > highest_ordp:
-                            highest_ordp = current_ordp
-            
-            logger.info(f"Found {new_record_count} new records based on NO_ORDP sequence")
-            
-            if all_records:
-                # Sort records by NO_ORDP to maintain proper sequence
-                all_records.sort(key=lambda x: x[0])  # Sort by the NO_ORDP value (first element)
-                
-                # Extract just the mapped records for batch processing
-                batch_records = [record for _, record in all_records]
-                
-                # Process all new records in batches
-                for i in range(0, len(batch_records), BATCH_SIZE):
-                    batch = batch_records[i:i + BATCH_SIZE]
-                    batch_result = self.send_inventory_codes_batch_to_api(batch)
-                    total_sent += len(batch)
-                    
-                    if batch_result.get("success"):
-                        # Calculate success count from the response
-                        result_data = batch_result.get("data", {})
-                        batch_success_count = result_data.get('success_count', len(batch))
-                        successful_sends += batch_success_count
-                        logger.info(f"Batch {i//BATCH_SIZE + 1} sent: {batch_success_count}/{len(batch)} records successful")
+                        reading = ScaleReading(weight=data, timestamp=timestamp)
+                        self.last_reading = reading
                         
-                        # Log any errors in the batch
-                        for j, res in enumerate(result_data.get('results', [])):
-                            if res.get('status') == 'error':
-                                logger.warning(f"Record {i + j} in batch failed: {res.get('errors', 'Unknown error')}")
-                    else:
-                        logger.error(f"Batch {i//BATCH_SIZE + 1} failed: {batch_result.get('error', 'Unknown error')}")
+                        # Escribir a CSV
+                        self._save_to_csv(reading)
                         
-                        # If batch failed, try sending records individually
-                        for idx, mapped_record in enumerate(batch):
-                            no_ordp = mapped_record.get('no_ordp', 'N/A')
-                            individual_result = self.send_inventory_code_to_api(mapped_record)
-                            
-                            if individual_result.get("success"):
-                                successful_sends += 1
-                                logger.info(f"New record with NO_ORDP {no_ordp} sent successfully (individual send)")
-                            else:
-                                logger.error(f"New record with NO_ORDP {no_ordp} failed: {individual_result.get('error', 'Unknown error')}")
+                        # Print to console immediately when data is received
+                        print(f"\033[92m[{timestamp}]\033[0m Peso: \033[93m{data}\033[0m")
                         
-                    # Show progress every 50 records
-                    records_processed = min(i + BATCH_SIZE, len(batch_records))
-                    if records_processed % 50 == 0:
-                        elapsed = time.time() - start_time
-                        rate = records_processed / elapsed if elapsed > 0 else 0
-                        logger.info(f"Processed {records_processed}/{new_record_count} new records ({rate:.1f} records/sec)...")
-            else:
-                logger.info("No new records found based on NO_ORDP sequence")
-                
-                # Show progress every 50 records
-                if record_count % 50 == 0:
-                    elapsed = time.time() - start_time
-                    rate = record_count / elapsed if elapsed > 0 else 0
-                    logger.info(f"Processed {record_count} records ({rate:.1f} records/sec)...")
+                        return reading
+                time.sleep(0.1)
             
-            logger.info(f"Overall result: {successful_sends}/{total_sent} records sent successfully")
-            
-            # Update state to track the highest NO_ORDP processed
-            # Always update the last processed ordp to maintain sequence
-            self.state['last_processed_ordp'] = highest_ordp
-            logger.info(f"Updated last processed NO_ORDP to: {highest_ordp}")
-            
-            # Update file info state
-            self.state['file_info'] = file_info
-            if self.save_state():
-                logger.info("State saved")
-            else:
-                logger.error("Failed to save state")
-            
-            elapsed_time = time.time() - start_time
-            logger.info(f'Processing completed in: {elapsed_time:.2f} seconds')
-            
-            logger.info("=" * 60)
-            logger.info("WAITING FOR NEXT CHECK...")
-            logger.info("=" * 60)
-            
-            return {
-                "status": "completed",
-                "records_processed": record_count,
-                "successful_sends": successful_sends,
-                "total_sent": total_sent,
-                "processing_time": elapsed_time
-            }
+            logger.warning("No se recibieron datos en el tiempo esperado.")
             
         except Exception as e:
-            logger.error(f"Critical error in process_ordprod_file: {e}")
-            logger.error(traceback.format_exc())
-            return {"status": "error", "message": str(e)}
-
-    def run_once(self) -> bool:
-        """Run processing once and return success status"""
+            logger.error(f"Error leyendo báscula: {str(e)}")
+            
+        return None
+    
+    def _save_to_csv(self, reading: ScaleReading):
+        """Guarda lectura en archivo CSV"""
         try:
-            result = self.process_ordprod_file()
-            if result.get("status") == "completed":
-                logger.info(f"Summary: {result.get('records_processed', 0)} records processed")
-                if 'successful_sends' in result:
-                    logger.info(f"Successfully sent: {result.get('successful_sends', 0)}/{result.get('total_sent', 0)} records")
-                return True
+            csv_file = './peso.csv'
+            with open(csv_file, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([reading.timestamp, reading.weight])
+        except Exception as e:
+            logger.error(f"Error guardando CSV: {str(e)}")
+    
+    def start_continuous_reading(self):
+        """Inicia lectura continua en hilo separado"""
+        self.is_running = True
+        
+        def read_loop():
+            while self.is_running:
+                reading = self.read_weight()
+                if reading:
+                    scale_data_queue.put(reading)
+                    # Print to console with colored output
+                    print(f"\033[92m[{reading.timestamp}]\033[0m Peso: \033[93m{reading.weight}\033[0m")
+                time.sleep(0.1)
+        
+        thread = threading.Thread(target=read_loop, daemon=True)
+        thread.start()
+        logger.info("✓ Lectura continua iniciada")
+        
+    def stop_continuous_reading(self):
+        """Detiene lectura continua"""
+        self.is_running = False
+        logger.info("✓ Lectura continua detenida")
+
+class PrinterManager:
+    def __init__(self):
+        self.device = None
+        self.endpoint_out = None
+        self.endpoint_in = None
+        
+    def connect_usb_printer(self) -> bool:
+        """Conecta con impresora TSC TX200 via USB usando tu código"""
+        try:
+            logger.info("Buscando impresora TSC TX200...")
+
+            # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+            self.device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+
+            if self.device is None:
+                logger.warning("✗ Impresora TSC TX200 no encontrada")
+                logger.warning("Verifica que esté conectada y encendida")
+                return False
+
+            logger.info(f"✓ Impresora encontrada: {self.device}")
+
+            try:
+                # Configurar dispositivo como en tu código
+                if self.device.is_kernel_driver_active(0):
+                    logger.info("Desconectando driver del kernel...")
+                    self.device.detach_kernel_driver(0)
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar acceder al dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                    return False
+                else:
+                    logger.error(f"✗ Error al manipular driver del kernel: {str(e)}")
+                    return False
+
+            # Establecer configuración
+            try:
+                self.device.set_configuration()
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar configurar el dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    return False
+                else:
+                    logger.error(f"✗ Error al configurar el dispositivo: {str(e)}")
+                    return False
+
+            # Obtener interface y endpoints
+            cfg = self.device.get_active_configuration()
+            intf = cfg[(0,0)]
+
+            # Encontrar endpoints
+            self.endpoint_out = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e: \
+                    usb.util.endpoint_direction(e.bEndpointAddress) == \
+                    usb.util.ENDPOINT_OUT
+            )
+
+            self.endpoint_in = usb.util.find_descriptor(
+                intf,
+                custom_match = lambda e: \
+                    usb.util.endpoint_direction(e.bEndpointAddress) == \
+                    usb.util.ENDPOINT_IN
+            )
+
+            if self.endpoint_out is None:
+                logger.error("✗ No se encontró endpoint de salida")
+                return False
+
+            logger.info(f"✓ Endpoint OUT: {self.endpoint_out.bEndpointAddress}")
+            if self.endpoint_in:
+                logger.info(f"✓ Endpoint IN: {self.endpoint_in.bEndpointAddress}")
+
+            logger.info("✓ Impresora conectada exitosamente!")
+            return True
+
+        except Exception as e:
+            logger.error(f"✗ Error al configurar dispositivo: {str(e)}")
+            return False
+
+    def enviar_comando(self, comando: str) -> bool:
+        """Envía comando TSPL2 a la impresora"""
+        if not self.device or not self.endpoint_out:
+            logger.error("✗ Dispositivo no conectado")
+            return False
+        
+        try:
+            # Convertir comando a bytes
+            if isinstance(comando, str):
+                comando = comando.encode('utf-8')
+            
+            # Enviar comando
+            bytes_escritos = self.endpoint_out.write(comando)
+            logger.debug(f"✓ Enviados {bytes_escritos} bytes: {comando.decode('utf-8').strip()}")
+            return True
+            
+        except usb.core.USBError as e:
+            if e.errno == 13:  # Permission denied
+                logger.error("✗ Error de permisos al intentar enviar comando al dispositivo USB")
+                logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                return False
             else:
-                logger.error(f"Processing failed: {result.get('message', 'Unknown error')}")
+                logger.error(f"✗ Error de USB al enviar comando: {str(e)}")
                 return False
         except Exception as e:
-            logger.error(f"Error in run_once: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"✗ Error enviando comando: {str(e)}")
             return False
+    
+    def print_label(self, content: str, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
+        """Imprime etiqueta con el contenido TSPL2 proporcionado, enviando todo en un solo bloque."""
+        try:
+            # Auto-conectar si no hay un dispositivo activo
+            if not self.device or not self.endpoint_out:
+                logger.info("Impresora no conectada, intentando auto-conectar...")
+                if not self.connect_usb_printer():
+                    logger.error("✗ Fallo al auto-conectar con la impresora.")
+                    return False
 
-    def run_continuous(self) -> None:
-        """Main loop that runs processing continuously"""
-        logger.info("Starting ORDPROD INVENTORY CODES processing service...")
-        logger.info("Configuration:")
-        logger.info(f"  - API URL: {API_BASE_URL}{INVENTORY_CODES_ENDPOINT}")
-        logger.info(f"  - Check interval: {CHECK_INTERVAL} seconds")
-        logger.info(f"  - DBF file: {ORDPROD_DBF_PATH}")
-        logger.info(f"  - Processing ALL records (no limit)")
-        logger.info("")
-        
-        while True:
-            try:
-                success = self.run_once()
-                logger.info(f"Sleeping for {CHECK_INTERVAL} seconds...")
-                time.sleep(CHECK_INTERVAL)
+            logger.info(f"=== IMPRIMIENDO ETIQUETA (BLOQUE UNICO) ===")
+            logger.info(f"Tamaño: {ancho_mm}x{alto_mm}mm")
+            logger.info(f"Contenido completo enviado:\n{content}")
+
+            # Enviar el bloque completo de comandos de una sola vez
+            if self.enviar_comando(content):
+                logger.info("✓ Bloque de comandos enviado a impresora correctamente.")
+                return True
+            else:
+                logger.error("✗ Falló el envío del bloque de comandos.")
+                return False
+
+        except Exception as e:
+            logger.error(f"✗ Error durante la impresión de etiqueta: {str(e)}")
+            return False
+    
+    def test_impresora(self, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
+        """Test básico usando comandos exactos de scaner.py"""
+        try:
+            if not self.device or not self.endpoint_out:
+                logger.error("✗ Dispositivo no conectado")
+                return False
                 
-            except KeyboardInterrupt:
-                logger.info("Stopping automatic processing service...")
-                break
+            logger.info("=== TEST DE IMPRESORA ===")
+            logger.info(f"Configurando para papel: {ancho_mm}mm x {alto_mm}mm")
+            
+            # Comandos de test exactos de tu scaner.py
+            comandos_test = [
+                f"SIZE {ancho_mm} mm, {alto_mm} mm\n",     # Tamaño del papel
+                "GAP 2 mm, 0 mm\n",                       # Espacio entre etiquetas  
+                "DIRECTION 1,0\n",                        # Dirección normal
+                "REFERENCE 0,0\n",                        # Punto de referencia en esquina
+                "OFFSET 0 mm\n",                          # Sin offset
+                "SET PEEL OFF\n",                         # Modo peeling desactivado
+                "SET CUTTER OFF\n",                       # Cortador desactivado
+                "SET PARTIAL_CUTTER OFF\n",               # Cortador parcial desactivado
+                "SET TEAR ON\n",                          # Modo tear activado
+                "CLS\n",                                  # Limpiar buffer de impresión
+                "CODEPAGE 1252\n",                        # Página de códigos occidental
+                
+                # Texto centrado y bien posicionado como en scaner.py
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*1.5)},\"4\",0,1,1,\"TSC TX200 TEST\"\n",
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*2.5)},\"3\",0,1,1,\"Papel: {ancho_mm}x{alto_mm}mm\"\n",
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*3.5)},\"2\",0,1,1,\"Configuracion OK!\"\n",
+                
+                # Línea de separación
+                f"BAR {int(ancho_mm*1.5)},{int(alto_mm*4.5)},{int(ancho_mm*5)},2\n",
+                
+                # Información de fecha/hora
+                f"TEXT {int(ancho_mm*2)},{int(alto_mm*5.5)},\"1\",0,1,1,\"{time.strftime('%Y-%m-%d %H:%M')}\"\n",
+                
+                "PRINT 1,1\n"                             # Imprimir 1 copia
+            ]
+            
+            logger.info("Enviando comandos de test...")
+            for i, comando in enumerate(comandos_test, 1):
+                logger.info(f"{i:2d}. {comando.strip()}")
+                if self.enviar_comando(comando):
+                    time.sleep(0.1)  # Pequeña pausa entre comandos
+                else:
+                    logger.error(f"✗ Error enviando comando {i}: {comando.strip()}")
+                    return False
+            
+            logger.info(f"✓ Test completado para papel {ancho_mm}x{alto_mm}mm")
+            logger.info("La etiqueta debería salir completa y centrada.")
+            return True
+
+        except usb.core.USBError as e:
+            if e.errno == 13:  # Permission denied
+                logger.error("✗ Error de permisos durante la impresión de prueba")
+                logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                return False
+            else:
+                logger.error(f"✗ Error de USB durante la impresión de prueba: {str(e)}")
+                return False
+        except Exception as e:
+            logger.error(f"✗ Error durante la impresión de prueba: {str(e)}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error en test de impresora: {str(e)}")
+            return False
+    
+    def disconnect(self):
+        """Desconecta de la impresora"""
+        if self.device:
+            try:
+                usb.util.dispose_resources(self.device)
+                logger.info("✓ Desconectado de la impresora")
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                logger.error(traceback.format_exc())
-                logger.info("Continuing...")
-                time.sleep(CHECK_INTERVAL)
+                logger.warning(f"Error desconectando: {str(e)}")
+            finally:
+                self.device = None
+                self.endpoint_out = None
+                self.endpoint_in = None
 
-def main():
-    """Main function"""
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        uploader = OrdProdInventoryUploader()
-        success = uploader.run_once()
-        sys.exit(0 if success else 1)
+# Instancias globales
+scale_manager = ScaleManager()
+printer_manager = PrinterManager()
+
+# Endpoints REST
+@app.route('/')
+def index():
+    """Página principal del monitor serial"""
+    return render_template('index.html')
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de salud del servidor"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'services': {
+            'scale': scale_manager.is_running,
+            'printer': printer_manager.device is not None
+        }
+    })
+
+@app.route('/scale/connect', methods=['POST'])
+def connect_scale():
+    """Conecta a la báscula"""
+    data = request.get_json() or {}
+    port = data.get('port', 'COM3')
+    baudrate = data.get('baudrate', 115200)
+    
+    scale_manager.port = port
+    scale_manager.baudrate = baudrate
+    
+    if scale_manager.connect():
+        return jsonify({'status': 'success', 'message': 'Báscula conectada'})
     else:
-        uploader = OrdProdInventoryUploader()
-        uploader.run_continuous()
+        return jsonify({'status': 'error', 'message': 'Error conectando báscula'}), 500
 
+@app.route('/scale/disconnect', methods=['POST'])
+def disconnect_scale():
+    """Desconecta la báscula"""
+    scale_manager.stop_continuous_reading()
+    scale_manager.disconnect()
+    response = jsonify({'status': 'success', 'message': 'Báscula desconectada'})
+    response.headers.add('Access-Control-Allow-Origin', '*') # Add this line
+    return response
+
+@app.route('/scale/start', methods=['POST'])
+def start_scale_reading():
+    """Inicia lectura continua de la báscula"""
+    if not scale_manager.serial_connection:
+        return jsonify({'status': 'error', 'message': 'Báscula no conectada'}), 400
+    
+    scale_manager.start_continuous_reading()
+    return jsonify({'status': 'success', 'message': 'Lectura continua iniciada'})
+
+@app.route('/scale/stop', methods=['POST'])
+def stop_scale_reading():
+    """Detiene lectura continua de la báscula"""
+    scale_manager.stop_continuous_reading()
+    return jsonify({'status': 'success', 'message': 'Lectura continua detenida'})
+
+@app.route('/scale/read', methods=['GET'])
+def read_scale():
+    """Lee peso actual de la báscula"""
+    reading = scale_manager.read_weight(timeout=10) # Wait up to 10 seconds
+    if reading:
+        return jsonify({
+            'status': 'success',
+            'weight': reading.weight,
+            'timestamp': reading.timestamp
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'No se pudo leer la báscula'}), 500
+
+@app.route('/scale/last', methods=['GET'])
+def get_last_reading():
+    """Obtiene última lectura de la báscula"""
+    if scale_manager.last_reading:
+        return jsonify({
+            'status': 'success',
+            'weight': scale_manager.last_reading.weight,
+            'timestamp': scale_manager.last_reading.timestamp
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'No hay lecturas disponibles'}), 404
+
+@app.route('/scale/latest', methods=['GET'])
+def get_latest_from_queue():
+    """Obtiene lecturas más recientes de la cola"""
+    readings = []
+    try:
+        while not scale_data_queue.empty():
+            reading = scale_data_queue.get_nowait()
+            readings.append({
+                'weight': reading.weight,
+                'timestamp': reading.timestamp,
+                'status': reading.status
+            })
+            # También imprimir en consola para debugging
+            print(f"\033[94m[API REQUEST]\033[0m [{reading.timestamp}] Peso: \033[93m{reading.weight}\033[0m")
+    except queue.Empty:
+        pass
+    
+    return jsonify({'status': 'success', 'readings': readings})
+
+@app.route('/printer/connect', methods=['POST'])
+def connect_printer():
+    """Conecta a la impresora"""
+    if printer_manager.connect_usb_printer():
+        return jsonify({'status': 'success', 'message': 'Impresora conectada'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
+
+@app.route('/connect', methods=['POST'])
+def connect_port():
+    """Conecta a un puerto serial o dispositivo USB"""
+    data = request.get_json()
+    if not data or 'port' not in data:
+        return jsonify({'status': 'error', 'message': 'Puerto requerido'}), 400
+    
+    port = data['port']
+    
+    # Si es la impresora USB, usar la conexión USB directa
+    if port == 'USB://TSC-TX200-0x0230':
+        if printer_manager.connect_usb_printer():
+            return jsonify({'status': 'success', 'message': 'Impresora conectada'})
+        else:
+            return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
+    else:
+        # Para otros puertos seriales tradicionales
+        try:
+            # Configurar el puerto en el manager de báscula
+            scale_manager.port = port
+            if scale_manager.connect():
+                return jsonify({'status': 'success', 'message': 'Conexión serial establecida'})
+            else:
+                return jsonify({'status': 'error', 'message': f'Error conectando al puerto {port}'}), 500
+        except Exception as e:
+            logger.error(f"Error conectando al puerto {port}: {str(e)}")
+            return jsonify({'status': 'error', 'message': f'Error conectando al puerto: {str(e)}'}), 500
+
+@app.route('/printer/print', methods=['POST'])
+def print_label():
+    """Imprime etiqueta"""
+    data = request.get_json()
+    if not data or 'content' not in data:
+        return jsonify({'status': 'error', 'message': 'Contenido requerido'}), 400
+    
+    content = data['content']
+    ancho_mm = data.get('ancho_mm', 80)
+    alto_mm = data.get('alto_mm', 50)
+    
+    if printer_manager.print_label(content, ancho_mm, alto_mm):
+        return jsonify({'status': 'success', 'message': 'Etiqueta impresa'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error imprimiendo'}), 500
+
+@app.route('/printer/test', methods=['POST'])
+def test_printer():
+    """Ejecuta test de impresora"""
+    data = request.get_json() or {}
+    ancho_mm = data.get('ancho_mm', 80)
+    alto_mm = data.get('alto_mm', 50)
+    
+    if printer_manager.test_impresora(ancho_mm, alto_mm):
+        return jsonify({'status': 'success', 'message': 'Test de impresora ejecutado'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Error en test de impresora'}), 500
+
+@app.route('/printer/disconnect', methods=['POST'])
+def disconnect_printer():
+    """Desconecta la impresora"""
+    printer_manager.disconnect()
+    return jsonify({'status': 'success', 'message': 'Impresora desconectada'})
+
+@app.route('/ports', methods=['GET'])
+def list_serial_ports():
+    """Lista puertos seriales disponibles"""
+    ports = []
+    for port in serial.tools.list_ports.comports():
+        ports.append({
+            'device': port.device,
+            'description': port.description,
+            'hwid': port.hwid
+        })
+
+    # Agregar dispositivo USB de la impresora TSC TX200 si está conectado
+    try:
+        # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
+        tsc_device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
+        if tsc_device is not None:
+            ports.append({
+                'device': 'USB://TSC-TX200-0x0230',
+                'description': 'TSC TX200 USB Printer',
+                'hwid': 'USB VID:PID=1203:0230'
+            })
+    except Exception as e:
+        logger.warning(f"Error buscando dispositivo TSC: {str(e)}")
+
+    return jsonify({'status': 'success', 'ports': ports})
+
+import argparse
+
+# ... (existing imports)
+
+# ... (existing code)
+
+# Servidor de desarrollo con auto-reload
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Servidor Flask para comunicación serial.')
+    parser.add_argument('--port', type=str, default='COM3', help='Puerto serial')
+    parser.add_argument('--baudrate', type=int, default=115200, help='Baud rate')
+    parser.add_argument('--parity', type=str, default='N', help='Paridad (N, E, O)')
+    parser.add_argument('--stopbits', type=int, default=1, help='Bits de parada')
+    parser.add_argument('--bytesize', type=int, default=8, help='Bits de datos')
+    args = parser.parse_args()
+
+    scale_manager.port = args.port
+    scale_manager.baudrate = args.baudrate
+    scale_manager.parity = args.parity
+    scale_manager.stopbits = args.stopbits
+    scale_manager.bytesize = args.bytesize
+
+    logger.info("=== Servidor Flask para Comunicación Serial ===")
+    logger.info("Compatible con TSC TX200 y báscula serial")
+    logger.info("===============================================")
+    logger.info("Endpoints disponibles:")
+    logger.info("  GET  /health - Estado del servidor")
+    logger.info("  GET  /ports - Puertos seriales disponibles")
+    logger.info("  POST /connect - Conectar a puerto serial o dispositivo USB")
+    logger.info("")
+    logger.info("BÁSCULA:")
+    logger.info("  POST /scale/connect - Conectar báscula")
+    logger.info("  POST /scale/start - Iniciar lectura continua")
+    logger.info("  POST /scale/stop - Detener lectura")
+    logger.info("  GET  /scale/read - Leer peso actual")
+    logger.info("  GET  /scale/last - Última lectura")
+    logger.info("  GET  /scale/latest - Lecturas de la cola")
+    logger.info("  GET  /scale/get_weight_now - Obtener peso con timeout")
+    logger.info("")
+    logger.info("IMPRESORA TSC TX200:")
+    logger.info("  POST /printer/connect - Conectar impresora USB")
+    logger.info("  POST /printer/print - Imprimir etiqueta")
+    logger.info("  POST /printer/test - Test de impresión")
+    logger.info("  POST /printer/disconnect - Desconectar impresora")
+    logger.info("===============================================")
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
