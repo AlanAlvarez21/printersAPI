@@ -24,6 +24,8 @@ import queue
 import subprocess
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+import webbrowser
+import atexit
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -167,21 +169,24 @@ class PrinterManager:
         self.device = None
         self.endpoint_out = None
         self.endpoint_in = None
-        
+        self.serial_connection = None  # Para conexión serial en Windows
+        self.is_usb_connection = False  # Para rastrear el tipo de conexión
+
     def connect_usb_printer(self) -> bool:
         """Conecta con impresora TSC TX200 via USB usando tu código"""
         try:
-            logger.info("Buscando impresora TSC TX200...")
+            logger.info("Buscando impresora TSC TX200 via USB...")
 
             # Buscar dispositivo TSC TX200 (Vendor ID: 0x1203, Product ID: 0x0230)
             self.device = usb.core.find(idVendor=0x1203, idProduct=0x0230)
 
             if self.device is None:
-                logger.warning("✗ Impresora TSC TX200 no encontrada")
-                logger.warning("Verifica que esté conectada y encendida")
-                return False
+                logger.warning("✗ Impresora TSC TX200 no encontrada via USB")
+                logger.info("  Buscando como puerto serial en Windows...")
+                return self._connect_serial_printer()
 
-            logger.info(f"✓ Impresora encontrada: {self.device}")
+            logger.info(f"✓ Impresora encontrada via USB: {self.device}")
+            self.is_usb_connection = True
 
             try:
                 # Configurar dispositivo como en tu código
@@ -237,47 +242,120 @@ class PrinterManager:
             if self.endpoint_in:
                 logger.info(f"✓ Endpoint IN: {self.endpoint_in.bEndpointAddress}")
 
-            logger.info("✓ Impresora conectada exitosamente!")
+            logger.info("✓ Impresora conectada via USB exitosamente!")
             return True
 
         except Exception as e:
-            logger.error(f"✗ Error al configurar dispositivo: {str(e)}")
+            logger.error(f"✗ Error al configurar dispositivo USB: {str(e)}")
+            logger.info("  Intentando conexión serial en su lugar...")
+            return self._connect_serial_printer()
+
+    def _connect_serial_printer(self) -> bool:
+        """Intenta conectar la impresora como puerto serial (útil en Windows)"""
+        try:
+            logger.info("Buscando impresora TSC TX200 como puerto serial...")
+
+            # Buscar puertos seriales disponibles
+            available_ports = []
+            for port in serial.tools.list_ports.comports():
+                # Buscar puertos que podrían ser la impresora TSC
+                if 'USB' in port.description or 'Serial' in port.description or port.vid == 0x1203:
+                    available_ports.append(port.device)
+                    logger.info(f"  Encontrado puerto potencial: {port.device} - {port.description}")
+
+            if not available_ports:
+                logger.warning("✗ No se encontraron puertos seriales que puedan ser la impresora TSC")
+                return False
+
+            # Intentar conectar a cada puerto disponible
+            for port in available_ports:
+                try:
+                    logger.info(f"  Intentando conectar a {port}...")
+                    self.serial_connection = serial.Serial(
+                        port=port,
+                        baudrate=115200,  # Típico para impresoras TSC
+                        bytesize=8,
+                        parity='N',
+                        stopbits=1,
+                        timeout=1
+                    )
+
+                    # Verificar si la conexión es exitosa
+                    if self.serial_connection.is_open:
+                        logger.info(f"✓ Conexión serial exitosa a {port}")
+                        self.is_usb_connection = False
+                        return True
+                except Exception as e:
+                    logger.warning(f"  Fallo al conectar a {port}: {str(e)}")
+                    continue
+
+            logger.error("✗ No se pudo conectar a la impresora como puerto serial")
+            return False
+
+        except Exception as e:
+            logger.error(f"✗ Error intentando conexión serial: {str(e)}")
             return False
 
     def enviar_comando(self, comando: str) -> bool:
-        """Envía comando TSPL2 a la impresora"""
-        if not self.device or not self.endpoint_out:
-            logger.error("✗ Dispositivo no conectado")
-            return False
-        
-        try:
-            # Convertir comando a bytes
-            if isinstance(comando, str):
-                comando = comando.encode('utf-8')
-            
-            # Enviar comando
-            bytes_escritos = self.endpoint_out.write(comando)
-            logger.debug(f"✓ Enviados {bytes_escritos} bytes: {comando.decode('utf-8').strip()}")
-            return True
-            
-        except usb.core.USBError as e:
-            if e.errno == 13:  # Permission denied
-                logger.error("✗ Error de permisos al intentar enviar comando al dispositivo USB")
-                logger.error("   Necesitas ejecutar este script con permisos adecuados")
-                logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+        """Envía comando TSPL2 a la impresora (USB o serial)"""
+        if self.is_usb_connection:
+            # Modo USB
+            if not self.device or not self.endpoint_out:
+                logger.error("✗ Dispositivo USB no conectado")
                 return False
-            else:
-                logger.error(f"✗ Error de USB al enviar comando: {str(e)}")
+
+            try:
+                # Convertir comando a bytes
+                if isinstance(comando, str):
+                    comando = comando.encode('utf-8')
+
+                # Enviar comando
+                bytes_escritos = self.endpoint_out.write(comando)
+                logger.debug(f"✓ Enviados {bytes_escritos} bytes via USB: {comando.decode('utf-8').strip()}")
+                return True
+
+            except usb.core.USBError as e:
+                if e.errno == 13:  # Permission denied
+                    logger.error("✗ Error de permisos al intentar enviar comando al dispositivo USB")
+                    logger.error("   Necesitas ejecutar este script con permisos adecuados")
+                    logger.error("   Verifica que el entorno tenga permisos para acceder a dispositivos USB")
+                    return False
+                else:
+                    logger.error(f"✗ Error de USB al enviar comando: {str(e)}")
+                    return False
+            except Exception as e:
+                logger.error(f"✗ Error enviando comando via USB: {str(e)}")
                 return False
-        except Exception as e:
-            logger.error(f"✗ Error enviando comando: {str(e)}")
-            return False
+        else:
+            # Modo serial
+            if not self.serial_connection or not self.serial_connection.is_open:
+                logger.error("✗ Conexión serial no establecida")
+                return False
+
+            try:
+                # Convertir comando a bytes
+                if isinstance(comando, str):
+                    comando = comando.encode('utf-8')
+
+                # Enviar comando
+                bytes_escritos = self.serial_connection.write(comando)
+                self.serial_connection.flush()  # Asegurar que los datos se envíen
+                logger.debug(f"✓ Enviados {bytes_escritos} bytes via serial: {comando.decode('utf-8').strip()}")
+                return True
+
+            except serial.SerialException as e:
+                logger.error(f"✗ Error de puerto serial al enviar comando: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"✗ Error enviando comando via serial: {str(e)}")
+                return False
     
     def print_label(self, content: str, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
         """Imprime etiqueta con el contenido TSPL2 proporcionado, enviando todo en un solo bloque."""
         try:
             # Auto-conectar si no hay un dispositivo activo
-            if not self.device or not self.endpoint_out:
+            if (self.is_usb_connection and (not self.device or not self.endpoint_out)) or \
+               (not self.is_usb_connection and (not self.serial_connection or not self.serial_connection.is_open)):
                 logger.info("Impresora no conectada, intentando auto-conectar...")
                 if not self.connect_usb_printer():
                     logger.error("✗ Fallo al auto-conectar con la impresora.")
@@ -285,7 +363,7 @@ class PrinterManager:
 
             logger.info(f"=== IMPRIMIENDO ETIQUETA (BLOQUE UNICO) ===")
             logger.info(f"Tamaño: {ancho_mm}x{alto_mm}mm")
-            logger.info(f"Contenido completo enviado:\n{content}")
+            logger.info(f"{'USB' if self.is_usb_connection else 'SERIAL'}: Contenido completo enviado:\n{content}")
 
             # Enviar el bloque completo de comandos de una sola vez
             if self.enviar_comando(content):
@@ -302,17 +380,18 @@ class PrinterManager:
     def test_impresora(self, ancho_mm: int = 80, alto_mm: int = 50) -> bool:
         """Test básico usando comandos exactos de scaner.py"""
         try:
-            if not self.device or not self.endpoint_out:
+            if (self.is_usb_connection and (not self.device or not self.endpoint_out)) or \
+               (not self.is_usb_connection and (not self.serial_connection or not self.serial_connection.is_open)):
                 logger.error("✗ Dispositivo no conectado")
                 return False
-                
+
             logger.info("=== TEST DE IMPRESORA ===")
             logger.info(f"Configurando para papel: {ancho_mm}mm x {alto_mm}mm")
-            
+
             # Comandos de test exactos de tu scaner.py
             comandos_test = [
                 f"SIZE {ancho_mm} mm, {alto_mm} mm\n",     # Tamaño del papel
-                "GAP 2 mm, 0 mm\n",                       # Espacio entre etiquetas  
+                "GAP 2 mm, 0 mm\n",                       # Espacio entre etiquetas
                 "DIRECTION 1,0\n",                        # Dirección normal
                 "REFERENCE 0,0\n",                        # Punto de referencia en esquina
                 "OFFSET 0 mm\n",                          # Sin offset
@@ -322,30 +401,33 @@ class PrinterManager:
                 "SET TEAR ON\n",                          # Modo tear activado
                 "CLS\n",                                  # Limpiar buffer de impresión
                 "CODEPAGE 1252\n",                        # Página de códigos occidental
-                
+
                 # Texto centrado y bien posicionado como en scaner.py
                 f"TEXT {int(ancho_mm*2)},{int(alto_mm*1.5)},\"4\",0,1,1,\"TSC TX200 TEST\"\n",
                 f"TEXT {int(ancho_mm*2)},{int(alto_mm*2.5)},\"3\",0,1,1,\"Papel: {ancho_mm}x{alto_mm}mm\"\n",
                 f"TEXT {int(ancho_mm*2)},{int(alto_mm*3.5)},\"2\",0,1,1,\"Configuracion OK!\"\n",
-                
+
                 # Línea de separación
                 f"BAR {int(ancho_mm*1.5)},{int(alto_mm*4.5)},{int(ancho_mm*5)},2\n",
-                
+
                 # Información de fecha/hora
                 f"TEXT {int(ancho_mm*2)},{int(alto_mm*5.5)},\"1\",0,1,1,\"{time.strftime('%Y-%m-%d %H:%M')}\"\n",
-                
+
                 "PRINT 1,1\n"                             # Imprimir 1 copia
             ]
-            
+
             logger.info("Enviando comandos de test...")
             for i, comando in enumerate(comandos_test, 1):
                 logger.info(f"{i:2d}. {comando.strip()}")
                 if self.enviar_comando(comando):
-                    time.sleep(0.1)  # Pequeña pausa entre comandos
+                    if self.is_usb_connection:
+                        time.sleep(0.1)  # Pequeña pausa entre comandos para USB
+                    else:
+                        time.sleep(0.05)  # Pausa más corta para serial
                 else:
                     logger.error(f"✗ Error enviando comando {i}: {comando.strip()}")
                     return False
-            
+
             logger.info(f"✓ Test completado para papel {ancho_mm}x{alto_mm}mm")
             logger.info("La etiqueta debería salir completa y centrada.")
             return True
@@ -359,26 +441,36 @@ class PrinterManager:
             else:
                 logger.error(f"✗ Error de USB durante la impresión de prueba: {str(e)}")
                 return False
+        except serial.SerialException as e:
+            logger.error(f"✗ Error de puerto serial durante la impresión de prueba: {str(e)}")
+            return False
         except Exception as e:
             logger.error(f"✗ Error durante la impresión de prueba: {str(e)}")
             return False
-            
-        except Exception as e:
-            logger.error(f"Error en test de impresora: {str(e)}")
-            return False
     
     def disconnect(self):
-        """Desconecta de la impresora"""
-        if self.device:
+        """Desconecta de la impresora (USB o serial)"""
+        if self.is_usb_connection and self.device:
             try:
                 usb.util.dispose_resources(self.device)
-                logger.info("✓ Desconectado de la impresora")
+                logger.info("✓ Desconectado de la impresora USB")
             except Exception as e:
-                logger.warning(f"Error desconectando: {str(e)}")
+                logger.warning(f"Error desconectando USB: {str(e)}")
             finally:
                 self.device = None
                 self.endpoint_out = None
                 self.endpoint_in = None
+        elif not self.is_usb_connection and self.serial_connection:
+            try:
+                self.serial_connection.close()
+                logger.info("✓ Desconectado de la impresora serial")
+            except Exception as e:
+                logger.warning(f"Error desconectando serial: {str(e)}")
+            finally:
+                self.serial_connection = None
+
+        # Resetear el tipo de conexión
+        self.is_usb_connection = False
 
 # Instancias globales
 scale_manager = ScaleManager()
@@ -489,7 +581,8 @@ def get_latest_from_queue():
 def connect_printer():
     """Conecta a la impresora"""
     if printer_manager.connect_usb_printer():
-        return jsonify({'status': 'success', 'message': 'Impresora conectada'})
+        connection_type = "USB" if printer_manager.is_usb_connection else "Serial"
+        return jsonify({'status': 'success', 'message': f'Impresora conectada via {connection_type}', 'connection_type': connection_type})
     else:
         return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
 
@@ -499,13 +592,14 @@ def connect_port():
     data = request.get_json()
     if not data or 'port' not in data:
         return jsonify({'status': 'error', 'message': 'Puerto requerido'}), 400
-    
+
     port = data['port']
-    
+
     # Si es la impresora USB, usar la conexión USB directa
     if port == 'USB://TSC-TX200-0x0230':
         if printer_manager.connect_usb_printer():
-            return jsonify({'status': 'success', 'message': 'Impresora conectada'})
+            connection_type = "USB" if printer_manager.is_usb_connection else "Serial"
+            return jsonify({'status': 'success', 'message': f'Impresora conectada via {connection_type}', 'connection_type': connection_type})
         else:
             return jsonify({'status': 'error', 'message': 'Error conectando impresora'}), 500
     else:
@@ -587,6 +681,38 @@ import argparse
 
 # ... (existing code)
 
+def start_ngrok_tunnel():
+    """Inicia el túnel ngrok para exponer el servidor local"""
+    try:
+        # Iniciar ngrok en segundo plano para exponer el puerto 5000
+        ngrok_process = subprocess.Popen(['ngrok', 'http', '--url=https://pregeological-nonidentical-ines.ngrok-free.app', '5000'])
+
+        # Esperar un momento para que ngrok inicie
+        time.sleep(3)
+
+        # Registrar la función para terminar ngrok cuando el script termine
+        def cleanup():
+            ngrok_process.terminate()
+            ngrok_process.wait()
+
+        atexit.register(cleanup)
+
+        logger.info("✓ Túnel ngrok iniciado exitosamente")
+        logger.info("✓ Abriendo navegador con la URL pública...")
+
+        # Abrir el navegador con la URL del cliente
+        webbrowser.open('https://wmsys.fly.dev')
+
+        return ngrok_process
+
+    except FileNotFoundError:
+        logger.error("✗ ngrok no encontrado. Asegúrate de tener ngrok instalado y en el PATH.")
+        logger.error("   Puedes descargarlo desde: https://ngrok.com/download")
+        return None
+    except Exception as e:
+        logger.error(f"✗ Error iniciando túnel ngrok: {str(e)}")
+        return None
+
 # Servidor de desarrollo con auto-reload
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Servidor Flask para comunicación serial.')
@@ -626,5 +752,24 @@ if __name__ == '__main__':
     logger.info("  POST /printer/test - Test de impresión")
     logger.info("  POST /printer/disconnect - Desconectar impresora")
     logger.info("===============================================")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+    # Iniciar el túnel ngrok en un hilo separado después de que Flask esté listo
+    def start_ngrok_after_flask():
+        time.sleep(2)  # Esperar a que Flask inicie
+        start_ngrok_tunnel()
+
+    # Iniciar Flask en un hilo separado para poder iniciar ngrok después
+    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Iniciar ngrok después de que Flask esté listo
+    start_ngrok_after_flask()
+
+    # Mantener el hilo principal vivo
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Cerrando servidor...")
+        sys.exit(0)
