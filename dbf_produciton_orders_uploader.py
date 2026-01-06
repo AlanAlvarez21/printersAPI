@@ -279,6 +279,10 @@ class PrinterManager:
                 elif any(keyword in port.description.upper() for keyword in ['TSC', 'USB', 'SERIAL', 'PRINTER']):
                     available_ports.append(port.device)
                     logger.info(f"  → Puerto potencial (por descripción): {port.device}")
+                # En Windows, también buscar puertos genéricos COM que podrían ser la impresora
+                elif 'COM' in port.device.upper():
+                    available_ports.append(port.device)
+                    logger.info(f"  → Puerto COM potencial: {port.device}")
 
             logger.info(f"  Total puertos encontrados: {len(all_ports)}")
             logger.info(f"  Puertos potenciales para TSC: {available_ports}")
@@ -302,7 +306,7 @@ class PrinterManager:
                     logger.info(f"  Intentando conectar a {port}...")
                     self.serial_connection = serial.Serial(
                         port=port,
-                        baudrate=115200,  # Típico para impresoras TSC
+                        baudrate=9600,  # Configuración específica para esta impresora
                         bytesize=8,
                         parity='N',
                         stopbits=1,
@@ -312,7 +316,7 @@ class PrinterManager:
                     # Verificar si la conexión es exitosa
                     if self.serial_connection.is_open:
                         logger.info(f"✓ Conexión serial exitosa a {port}")
-                        logger.info(f"  Configuración: 115200 baud, 8N1")
+                        logger.info(f"  Configuración: 9600 baud, 8N1")
                         self.is_usb_connection = False
                         return True
                     else:
